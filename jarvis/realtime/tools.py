@@ -1065,6 +1065,12 @@ class RealtimeToolBridge:
         blocked, reason = _is_stt_hallucinated(name, arguments)
         if blocked:
             message = f"Suspected speech-recognition argument error: {reason}"
+        elif name == "forge_mind":
+            from jarvis.forge.tool import command
+
+            if not arguments and command(user_text) is not None:
+                return ""
+            message = "FORGE requires an exact command in the current user transcript."
         elif _is_instructional_question(user_text) and _is_side_effect_tool(descriptor):
             message = "The user asked for instructions; the side-effect tool was not run."
         elif _is_self_identification(user_text) and _is_side_effect_tool(descriptor):

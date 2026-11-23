@@ -428,10 +428,56 @@ function Write-Response {
     Write-Atomic -Path (Join-Path $mailbox "$Seq.res.json") -Bytes ([System.Text.Encoding]::UTF8.GetBytes($json))
 }
 
+$forgeMode = $false
+$forgeForm = $null
+$forgeText = $null
+if ($config.PSObject.Properties.Name -contains 'forge_fixture' -and $config.forge_fixture -eq $true) {
+    $forgeMode = $true
+    $forgeForm = New-Object System.Windows.Forms.Form
+    $forgeForm.Text = 'FORGE MIND fixture'
+    $forgeForm.TopMost = $true
+    $forgeText = New-Object System.Windows.Forms.TextBox
+    $forgeText.Dock = [System.Windows.Forms.DockStyle]::Top
+    $forgeText.ReadOnly = $true
+    $forgeForm.Controls.Add($forgeText)
+    $forgeForm.Show()
+    $forgeForm.Activate()
+}
+
+function Invoke-ForgeRequest {
+    param([string]$Method, $Params)
+    $available = -not $forgeForm.IsDisposed -and $forgeForm.Visible
+    switch ($Method) {
+        'health' { return @{ ok = $available; v = $protocolVersion; kind = 'windows-sandbox' } }
+        'quit' { return @{ ok = $true } }
+        'foreground' {
+            if (-not $available) { return @{ ok = $true; available = $false } }
+            $handle = $forgeForm.Handle.ToInt64().ToString()
+            return @{ ok = $true; available = $true; handle = $handle
+                      title = 'FORGE MIND fixture'; app = 'forge-text-v1'; rect = @(0,0,1,1) }
+        }
+        'typed_text_landed' {
+            if (-not $available) { return @{ ok = $true; landed = $null } }
+            return @{ ok = $true; landed = ($forgeText.Text -ceq [string]$Params.text) }
+        }
+        'act' {
+            if (-not $available -or $Params.action -cne 'type_text' -or
+                    [string]$Params.params.text -cnotin @('FORGE ALPHA', 'FORGE BETA') -or
+                    $forgeText.Text -cne '') {
+                return @{ ok = $false; error = 'fixture action denied' }
+            }
+            $forgeText.Text = [string]$Params.params.text
+            return @{ ok = $true; detail = 'fixture updated' }
+        }
+        default { return @{ ok = $false; error = 'operation outside fixture capability' } }
+    }
+}
+
 $running = $true
 Write-Host "[jarvis-screen] runner up, mailbox $mailbox"
 
 while ($running) {
+    if ($forgeMode) { [System.Windows.Forms.Application]::DoEvents() }
     $requests = @(Get-ChildItem -LiteralPath $mailbox -Filter '*.req.json' -ErrorAction SilentlyContinue | Sort-Object Name)
     if ($requests.Count -eq 0) { Start-Sleep -Milliseconds 15; continue }
 
@@ -454,7 +500,11 @@ while ($running) {
             else {
                 $method = [string]$request.method
                 $p = $request.params
-                switch ($method) {
+                if ($forgeMode) {
+                    $envelope = Invoke-ForgeRequest -Method $method -Params $p
+                    if ($method -ceq 'quit') { $running = $false }
+                }
+                else { switch ($method) {
                     'health' { $envelope = @{ ok = $true; v = $protocolVersion; kind = 'windows-sandbox' } }
                     'geometry' {
                         $v = [JarvisScreen]::VirtualScreen()
@@ -495,7 +545,7 @@ while ($running) {
                     }
                     'quit' { $envelope = @{ ok = $true }; $running = $false }
                     default { $envelope = @{ ok = $false; error = "unknown method '$method'" } }
-                }
+                } }
             }
         }
         catch {

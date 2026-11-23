@@ -10898,6 +10898,40 @@ class BrainManager:
         skill_state = _SkillTurnState(self)
         skill_token = _SKILL_TURN_STATE.set(skill_state)
         try:
+            if user_text.lstrip().lower().startswith("forge "):
+                from jarvis.forge.tool import NAMESPACE, command, render_result
+
+                if NAMESPACE.match(user_text.lstrip()):
+                    tid = trace_id or uuid4()
+                    forge = self._tools.get("forge_mind")
+                    tool_context = dict(turn_override.tool_context) if turn_override else {}
+                    tool_context["forge_interactive"] = (
+                        source_layer == "ui.chat.typed" or consume_pending_voice_attachments
+                    )
+                    if command(user_text) is None:
+                        reply = "FORGE command unsupported. Say or type forge list to inspect skills."
+                    elif forge is None or self._tool_executor is None:
+                        reply = "FORGE is disabled."
+                    elif (
+                        turn_override
+                        and turn_override.tool_filter
+                        and turn_override.tool_filter({"forge_mind": forge}).get("forge_mind")
+                        is not forge
+                    ):
+                        reply = "FORGE is unavailable in this chat mode."
+                    else:
+                        result = await self._tool_executor.execute(
+                            forge,
+                            {},
+                            user_utterance=user_text,
+                            trace_id=tid,
+                            config_snapshot=tool_context,
+                        )
+                        reply = render_result(result)
+                    if text_consumer is not None:
+                        text_consumer(reply)
+                    await self._publish_response_generated(trace_id=tid, text=reply)
+                    return reply
             return await self._generate(
                 user_text,
                 use_history=use_history,

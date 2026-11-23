@@ -23,6 +23,7 @@ tempted to undo both:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -48,6 +49,7 @@ from jarvis.agent_screen.providers.base import (
 )
 from jarvis.agent_screen.session import RemoteScreenSession
 from jarvis.agent_screen.wire import MailboxTransport
+from jarvis.core.process_utils import NO_WINDOW_CREATIONFLAGS
 
 logger = logging.getLogger(__name__)
 
@@ -94,10 +96,14 @@ class WindowsSandboxProvider(ScreenProvider):
         memory_mb: int = 4096,
         networking: bool = True,
         vgpu: bool = False,
+        forge_fixture: bool = False,
     ) -> None:
         self._memory_mb = max(1024, int(memory_mb))
         self._networking = bool(networking)
         self._vgpu = bool(vgpu)
+        self._forge_fixture = forge_fixture
+        if forge_fixture and (networking or vgpu):
+            raise ValueError("FORGE fixture requires network and vGPU disabled")
 
     # -- probe -------------------------------------------------------------
 
@@ -160,15 +166,19 @@ class WindowsSandboxProvider(ScreenProvider):
         import json  # noqa: PLC0415
 
         (rpc_dir / "config.json").write_text(
-            json.dumps({"token": token, "mailbox": _GUEST_RPC_DIR}, ensure_ascii=False),
+            json.dumps(
+                {
+                    "token": token,
+                    "mailbox": _GUEST_RPC_DIR,
+                    "forge_fixture": self._forge_fixture,
+                }
+            ),
             encoding="utf-8",
         )
 
         wsb_path = root / f"{screen_id}.wsb"
-        wsb_path.write_text(
-            self._render_config(runner_dir, rpc_dir, profile_root()),
-            encoding="utf-8",
-        )
+        profile = None if self._forge_fixture else profile_root()
+        wsb_path.write_text(self._render_config(runner_dir, rpc_dir, profile), encoding="utf-8")
 
         managed_by_cli, process = self._launch(screen_id, wsb_path)
 
@@ -191,6 +201,23 @@ class WindowsSandboxProvider(ScreenProvider):
             raise
         self._sweep(rpc_dir)
         return session
+
+    def _child_env(self) -> dict[str, str] | None:
+        if not self._forge_fixture:
+            return None
+        keys = {
+            "SYSTEMROOT",
+            "WINDIR",
+            "SYSTEMDRIVE",
+            "TEMP",
+            "TMP",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+            "PROGRAMDATA",
+            "PROGRAMFILES",
+            "PROGRAMFILES(X86)",
+        }
+        return {key: value for key, value in os.environ.items() if key.upper() in keys}
 
     def _launch(
         self,
@@ -216,6 +243,8 @@ class WindowsSandboxProvider(ScreenProvider):
                     argv,
                     capture_output=True,
                     timeout=90,
+                    env=self._child_env(),
+                    creationflags=NO_WINDOW_CREATIONFLAGS,
                     check=False,
                 )
                 if completed.returncode == 0:
@@ -226,7 +255,12 @@ class WindowsSandboxProvider(ScreenProvider):
                     completed.returncode,
                     completed.stderr[:200].decode("utf-8", "replace"),
                 )
-            except (OSError, subprocess.TimeoutExpired) as exc:
+            except subprocess.TimeoutExpired as exc:
+                if self._forge_fixture:
+                    self._stop(screen_id, True, None)
+                    raise AgentScreenUnavailable("sandbox launch timed out") from exc
+                logger.info("[agent-screen] wsb start timed out (%s)", exc)
+            except OSError as exc:
                 logger.info("[agent-screen] wsb start unusable (%s)", exc)
         if classic is None:
             raise AgentScreenUnavailable(
@@ -237,7 +271,16 @@ class WindowsSandboxProvider(ScreenProvider):
         # The classic launcher always shows its viewer window — the sandbox is
         # isolated but not invisible on this path. Reported honestly by the
         # manager rather than papered over.
-        return (False, popen_detached([classic, str(wsb_path)]))
+        if not self._forge_fixture:
+            return (False, popen_detached([classic, str(wsb_path)]))
+        return (
+            False,
+            popen_detached(
+                [classic, str(wsb_path)],
+                env=self._child_env(),
+                inherit_env=False,
+            ),
+        )
 
     @staticmethod
     def _sweep(rpc_dir: Path) -> None:
@@ -248,13 +291,19 @@ class WindowsSandboxProvider(ScreenProvider):
             except OSError:  # noqa: PERF203 — hygiene only
                 logger.debug("could not clear a stale mailbox file", exc_info=True)
 
-    def _render_config(self, runner_dir: Path, rpc_dir: Path, profile_dir: Path) -> str:
+    def _render_config(self, runner_dir: Path, rpc_dir: Path, profile_dir: Path | None) -> str:
         """Render the .wsb XML. Host paths are escaped — they contain user text."""
         mapped = [
             (runner_dir, _GUEST_RUNNER_DIR, True),
             (rpc_dir, _GUEST_RPC_DIR, False),
-            (profile_dir, _GUEST_PROFILE_DIR, False),
         ]
+        if profile_dir is not None:
+            mapped.append((profile_dir, _GUEST_PROFILE_DIR, False))
+        clipboard = (
+            "  <ClipboardRedirection>Disable</ClipboardRedirection>\n"
+            if self._forge_fixture
+            else ""
+        )
         folders = "\n".join(
             "    <MappedFolder>\n"
             f"      <HostFolder>{xml_escape(str(host))}</HostFolder>\n"
@@ -272,6 +321,7 @@ class WindowsSandboxProvider(ScreenProvider):
             "<Configuration>\n"
             f"  <VGpu>{'Enable' if self._vgpu else 'Disable'}</VGpu>\n"
             f"  <Networking>{'Enable' if self._networking else 'Disable'}</Networking>\n"
+            f"{clipboard}"
             f"  <MemoryInMB>{self._memory_mb}</MemoryInMB>\n"
             "  <MappedFolders>\n"
             f"{folders}\n"
@@ -318,11 +368,14 @@ class WindowsSandboxProvider(ScreenProvider):
                         [wsb, "stop", "--id", screen_id],
                         capture_output=True,
                         timeout=60,
+                        env=self._child_env(),
+                        creationflags=NO_WINDOW_CREATIONFLAGS,
                         check=False,
                     )
                 except (OSError, subprocess.TimeoutExpired):
                     logger.warning(
-                        "[agent-screen] could not stop sandbox %s", screen_id,
+                        "[agent-screen] could not stop sandbox %s",
+                        screen_id,
                         exc_info=True,
                     )
         terminate_quietly(process)

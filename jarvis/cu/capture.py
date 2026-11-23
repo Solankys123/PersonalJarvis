@@ -82,7 +82,17 @@ class _CapturedPixels:
     data: bytes | bytearray | memoryview
 
 
-_RawCapture = tuple[tuple[int, int], bytes] | _CapturedPixels
+RawCapture = tuple[tuple[int, int], bytes] | _CapturedPixels
+_RawCapture = RawCapture
+
+
+def raw_pixels(size: tuple[int, int], data: bytes, *, pixel_format: str) -> RawCapture:
+    """Adapt a remote frame without converting native BGRX data prematurely."""
+    if pixel_format == "BGRX":
+        return _CapturedPixels(size, data)
+    if pixel_format == "RGB":
+        return size, data
+    raise ValueError("unsupported screen pixel format")
 
 
 def _capture_size(raw: _RawCapture) -> tuple[int, int]:

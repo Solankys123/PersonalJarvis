@@ -1933,6 +1933,7 @@ def test_router_tools_is_pure_dispatcher_set() -> None:
             # so it never enters a worker tool-set (AP-5/AP-14). See ADR-0011
             # amendment "Computer-Use Router Tool".
             "computer-use",
+            "forge-mind",
             # Profile-write (2026-05-30): deterministic writer for the structured
             # USER.md profile clusters (the Knowledge-matrix + system-prompt
             # source). The sanctioned structured-profile analogue of wiki-ingest
@@ -3873,3 +3874,77 @@ def test_internal_message_tool_is_router_only():
 
     assert "message-agent" in ROUTER_TOOLS
     assert "message_agent" in NEVER_GRANTED
+
+
+def test_forge_mind_is_registered_on_the_router() -> None:
+    from jarvis.brain.factory import ROUTER_TOOLS
+    from jarvis.society.capabilities import NEVER_GRANTED
+
+    assert "forge-mind" in ROUTER_TOOLS
+    assert "forge_mind" in NEVER_GRANTED
+
+
+@pytest.mark.asyncio
+async def test_forge_chat_and_classic_speech_route_without_model(tmp_path) -> None:
+    from contextlib import asynccontextmanager
+
+    from jarvis.forge.engine import Limits
+    from jarvis.forge.store import Store
+    from jarvis.forge.tool import ForgeMindTool
+    from jarvis.safety.approval import ApprovalWorkflow
+    from jarvis.safety.risk_tier import RiskTierEvaluator
+    from jarvis.safety.tool_executor import ToolExecutor
+
+    @asynccontextmanager
+    async def no_guest(*args):
+        raise AssertionError("listing should never boot a guest")
+        yield
+
+    config = JarvisConfig()
+    bus = EventBus()
+    executor = ToolExecutor(bus, RiskTierEvaluator(config.safety), ApprovalWorkflow(bus))
+    tool = ForgeMindTool(Store(tmp_path / "forge.sqlite"), no_guest, Limits())
+    manager = BrainManager(config, bus, tools={tool.name: tool}, tool_executor=executor)
+    expected = "No FORGE procedures have been saved."
+    assert await manager.generate("forge list", source_layer="ui.chat.typed") == expected
+    unsupported = await manager.generate(
+        "forge learn open the host shell", source_layer="ui.chat.typed",
+    )
+    assert unsupported.startswith("FORGE command unsupported.")
+    spoken = [
+        chunk async for chunk in manager.generate_stream(
+            "forge list", consume_pending_voice_attachments=True,
+        )
+    ]
+    assert "".join(spoken) == expected
+
+
+@pytest.mark.asyncio
+async def test_forge_realtime_gateway_uses_current_transcript(tmp_path) -> None:
+    from contextlib import asynccontextmanager
+
+    from jarvis.brain.tool_gateway import BrainSupervisorToolGateway
+    from jarvis.forge.engine import Limits
+    from jarvis.forge.store import Store
+    from jarvis.forge.tool import ForgeMindTool
+    from jarvis.realtime.tools import RealtimeToolBridge
+    from jarvis.safety.approval import ApprovalWorkflow
+    from jarvis.safety.risk_tier import RiskTierEvaluator
+    from jarvis.safety.tool_executor import ToolExecutor
+
+    @asynccontextmanager
+    async def no_guest(*args):
+        raise AssertionError("listing should never boot a guest")
+        yield
+
+    config = JarvisConfig()
+    bus = EventBus()
+    executor = ToolExecutor(bus, RiskTierEvaluator(config.safety), ApprovalWorkflow(bus))
+    tool = ForgeMindTool(Store(tmp_path / "forge.sqlite"), no_guest, Limits())
+    manager = BrainManager(config, bus, tools={tool.name: tool}, tool_executor=executor)
+    bridge = RealtimeToolBridge(gateway=BrainSupervisorToolGateway(manager), language="en")
+    _, forbidden = await bridge.execute(wire_name=tool.name, arguments={})
+    assert forbidden["success"] is False
+    await bridge.handle_user_transcript("forge list")
+    _, result = await bridge.execute(wire_name=tool.name, arguments={})
+    assert result["success"] is True, result

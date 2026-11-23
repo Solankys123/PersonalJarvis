@@ -89,6 +89,7 @@ def popen_detached(
     *,
     env: dict[str, str] | None = None,
     cwd: Path | None = None,
+    inherit_env: bool = True,
 ) -> subprocess.Popen[bytes]:
     """Start a helper process without flashing a console window.
 
@@ -98,7 +99,7 @@ def popen_detached(
     """
     from jarvis.core.process_utils import NO_WINDOW_CREATIONFLAGS  # noqa: PLC0415
 
-    merged = dict(os.environ)
+    merged = dict(os.environ) if inherit_env else {}
     if env:
         merged.update(env)
     merged.setdefault("PYTHONIOENCODING", "utf-8")

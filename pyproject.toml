@@ -619,6 +619,7 @@ local-realtime = "jarvis.plugins.realtime.openai_realtime:LocalRealtimeProvider"
 local-voice = "jarvis.plugins.realtime.local_voice:LocalVoiceProvider"
 
 [project.entry-points."jarvis.tool"]
+forge-mind = "jarvis.forge.tool:ForgeMindTool"
 live-screen-snapshot = "jarvis.plugins.tool.live_screen:LiveScreenTool"
 open-app = "jarvis.plugins.tool.open_app:OpenAppTool"
 type-text = "jarvis.plugins.tool.type_text:TypeTextTool"
@@ -843,6 +844,7 @@ jarvis = [
     # Node bot scripts shipped alongside their Python bridge tools (e.g. the
     # google_calendar bot). Not Python, so packages.find won't pick them up.
     "plugins/tool/*.mjs",
+    "agent_screen/runner/sandbox_runner.ps1",
     # AP-23 wave-2 finding 6: runtime data files read via `Path(__file__)` at
     # first use, missing from wheel installs — masked today only because
     # every dev install is editable (source tree == package tree).
