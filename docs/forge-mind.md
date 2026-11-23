@@ -65,14 +65,32 @@ There are no screenshots, arbitrary command strings, or credential inputs.
 
 ## Windows verification and rollback
 
-Before relying on the feature on Windows, inspect the generated sandbox XML,
-confirm the fixture starts, then run the command sequence through chat and
-local speech. Verify the first procedure stays a draft until the second guest
-validates it and you explicitly promote it. Close the fixture during a run
-and verify it fails safely. Confirm cancellation closes only the assigned
-guest. Measure guest startup, peak RAM, paging, and replay latency on the
-target hardware. The Linux test suite uses a deterministic fake screen and
-does not launch Windows Sandbox.
+Run this checklist on the Windows 11 i3/8 GB acceptance machine using
+an already enabled Windows Sandbox. Record the Windows build, Jarvis commit,
+and profile settings. Linux tests use a fake screen and cannot qualify the host.
+
+- **Availability and isolation.** Check that Windows Sandbox opens. While the
+  fixture runs, inspect its generated `.wsb` for disabled networking,
+  clipboard redirection, and vGPU. Verify it maps only the read-only runner
+  and the writable session mailbox. Keep a benign host window open and
+  confirm its text stays untouched through the run.
+- **Lifecycle.** Run the command sequence above. Confirm a new draft cannot
+  replay, same-marker validation fails, a different marker in a fresh guest
+  validates, promotion requires the explicit command, and replay succeeds.
+- **Cancellation and cleanup.** Issue Emergency Stop during boot and close
+  the fixture mid-run. Verify the assigned guest exits, unrelated guests
+  stay open, and the interrupted attempt does not create a usable draft.
+  Start a fresh run to verify the guest lease was released.
+- **Offline and privacy.** With local speech assets already installed, use
+  an offline connection profile approved for the test machine. Repeat the
+  sequence through text and classic speech with local STT/TTS. Check the
+  logs and SQLite evidence for outcomes and marker IDs. Confirm no FORGE
+  screenshot files appear. If testing realtime voice separately, record
+  whether the selected provider receives audio or transcripts.
+- **Resources.** Use Task Manager or Performance Monitor to record idle
+  available RAM and CPU, minimum available RAM and peak CPU during guest
+  boot and replay, paging, and boot-to-result time. Repeat three times and
+  record whether the desktop and speech remain responsive.
 
 Set `forge.enabled = false` and restart to disable the tool. To remove the
 feature from a development install, switch to your prior checkout and refresh

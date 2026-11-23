@@ -85,6 +85,22 @@ def _sandbox_binaries() -> tuple[str | None, str | None]:
     return (wsb, classic)
 
 
+def _system_sandbox_binaries() -> tuple[str | None, str | None]:
+    """Resolve FORGE launchers from the Windows system directory only."""
+    if sys.platform != "win32":
+        return (None, None)
+    import ctypes  # noqa: PLC0415
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    size = ctypes.windll.kernel32.GetSystemDirectoryW(buffer, len(buffer))
+    if not 0 < size < len(buffer):
+        return (None, None)
+    system = Path(buffer.value)
+    wsb = system / "wsb.exe"
+    classic = system / "WindowsSandbox.exe"
+    return (str(wsb) if wsb.is_file() else None, str(classic) if classic.is_file() else None)
+
+
 class WindowsSandboxProvider(ScreenProvider):
     """Boots a Windows Sandbox and drives it through a mapped mailbox."""
 
@@ -105,6 +121,9 @@ class WindowsSandboxProvider(ScreenProvider):
         if forge_fixture and (networking or vgpu):
             raise ValueError("FORGE fixture requires network and vGPU disabled")
 
+    def _binaries(self) -> tuple[str | None, str | None]:
+        return _system_sandbox_binaries() if self._forge_fixture else _sandbox_binaries()
+
     # -- probe -------------------------------------------------------------
 
     def probe(self) -> ProbeResult:
@@ -115,7 +134,7 @@ class WindowsSandboxProvider(ScreenProvider):
                 reason="Windows Sandbox exists only on Windows",
                 remedy="",
             )
-        wsb, classic = _sandbox_binaries()
+        wsb, classic = self._binaries()
         if wsb is None and classic is None:
             return ProbeResult(
                 kind=self.kind,
@@ -142,7 +161,7 @@ class WindowsSandboxProvider(ScreenProvider):
         manages named instances. Reporting the truth keeps the manager from
         promising a second screen that the host will refuse to boot.
         """
-        wsb, _classic = _sandbox_binaries()
+        wsb, _classic = self._binaries()
         return 4 if wsb is not None else 1
 
     # -- start -------------------------------------------------------------
@@ -235,7 +254,7 @@ class WindowsSandboxProvider(ScreenProvider):
 
         Returns ``(managed_by_cli, process)``.
         """
-        wsb, classic = _sandbox_binaries()
+        wsb, classic = self._binaries()
         if wsb is not None:
             argv = [wsb, "start", "--config", str(wsb_path), "--id", screen_id]
             try:
@@ -361,7 +380,7 @@ class WindowsSandboxProvider(ScreenProvider):
     ) -> None:
         """Tear down exactly THIS sandbox, never any other."""
         if managed_by_cli:
-            wsb, _classic = _sandbox_binaries()
+            wsb, _classic = self._binaries()
             if wsb is not None:
                 try:
                     subprocess.run(  # noqa: S603 — fixed system binary

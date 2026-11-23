@@ -67,6 +67,45 @@ class Store:
         procedure.validate()
         return procedure, row[1]
 
+    def receipt(self, run_id: str) -> tuple[int | None, str] | None:
+        with self.connection() as db:
+            return self._receipt(db, run_id)
+
+    @staticmethod
+    def _receipt(db: sqlite3.Connection, run_id: str) -> tuple[int | None, str] | None:
+        row = db.execute(
+            "SELECT version, outcome, mode, evidence FROM runs WHERE id=?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        version, outcome, mode, evidence = row
+        if mode == "validate" and outcome == Verdict.SUCCESS:
+            # Older receipts recorded action success even for a repeated marker.
+            original = Store._learning_evidence(db, version)
+            steps = json.loads(evidence)
+            state = db.execute(
+                "SELECT state FROM procedures WHERE version=?", (version,)
+            ).fetchone()
+            if (
+                not steps
+                or not original
+                or not state
+                or state[0] == "draft"
+                or steps[-1]["marker"] == original["marker"]
+                or steps[-1]["target_id"] == original["target_id"]
+            ):
+                outcome = "independent_validation_required"
+        return version, outcome
+
+    @staticmethod
+    def _learning_evidence(db: sqlite3.Connection, version: int | None) -> dict | None:
+        row = db.execute(
+            "SELECT evidence FROM runs WHERE version=? AND mode='learn'",
+            (version,),
+        ).fetchone()
+        return json.loads(row[0])[-1] if row else None
+
     def claim(self, run_id: str, mode: str, version: int | None) -> tuple[int | None, str] | None:
         """Reserve a delivery before starting its guest, or return the old receipt."""
         with self.connection() as db:
@@ -76,14 +115,11 @@ class Store:
             ).rowcount
             if inserted:
                 return None
-            return db.execute(
-                "SELECT version, outcome FROM runs WHERE id=?",
-                (run_id,),
-            ).fetchone()
+            return self._receipt(db, run_id)
 
     def record(
         self, run_id: str, mode: str, version: int | None, outcome: str, evidence: list[Evidence]
-    ) -> int | None:
+    ) -> tuple[int | None, str]:
         final = evidence[-1] if evidence else None
         verified = (
             outcome == Verdict.SUCCESS
@@ -102,21 +138,19 @@ class Store:
                 )
                 version = row.lastrowid
             if mode == "validate" and verified:
-                learned = db.execute(
-                    "SELECT evidence FROM runs WHERE version=? AND mode='learn'",
-                    (version,),
-                ).fetchone()
-                if learned:
-                    original = json.loads(learned[0])[-1]
-                    if (
-                        original["target_id"] != evidence[-1].target_id
-                        and original["marker"] != evidence[-1].marker
-                    ):
-                        db.execute(
-                            "UPDATE procedures SET state='validated' "
-                            "WHERE version=? AND state='draft'",
-                            (version,),
-                        )
+                original = self._learning_evidence(db, version)
+                changed = 0
+                if (
+                    original
+                    and original["target_id"] != final.target_id
+                    and original["marker"] != final.marker
+                ):
+                    changed = db.execute(
+                        "UPDATE procedures SET state='validated' WHERE version=? AND state='draft'",
+                        (version,),
+                    ).rowcount
+                if changed != 1:
+                    outcome = "independent_validation_required"
             db.execute(
                 "INSERT INTO runs VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET version=excluded.version, "
@@ -129,7 +163,7 @@ class Store:
                     json.dumps([step.record() for step in evidence]),
                 ),
             )
-        return version
+        return version, outcome
 
     def promote(self, version: int, *, authorized: bool) -> None:
         if not authorized:

@@ -59,6 +59,19 @@ class WindowsFixture:
         return result.success
 
 
+async def _finish_owned_task(task: asyncio.Task) -> None:
+    """Finish bounded guest cleanup despite repeated caller cancellation."""
+    cancellation = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    task.result()
+    if cancellation is not None:
+        raise cancellation
+
+
 def fixture_factory(executor: Any, *, memory_mb: int):
     provider = WindowsSandboxProvider(memory_mb=memory_mb, networking=False, forge_fixture=True)
     manager = AgentScreenManager(
@@ -74,18 +87,21 @@ def fixture_factory(executor: Any, *, memory_mb: int):
         try:
             lease = await asyncio.shield(pending)
         except asyncio.CancelledError:
-            try:
-                lease = await pending
-            except (AgentScreenUnavailable, OSError):
-                pass
-            else:
+
+            async def release_after_start() -> None:
+                try:
+                    lease = await pending
+                except (AgentScreenUnavailable, OSError):
+                    return
                 await manager.release(lease)
+
+            await _finish_owned_task(asyncio.create_task(release_after_start()))
             raise
         except (AgentScreenUnavailable, OSError):
             raise Refused("sandbox_unavailable") from None
         try:
             yield WindowsFixture(lease.session, executor, context)
         finally:
-            await manager.release(lease)
+            await _finish_owned_task(asyncio.create_task(manager.release(lease)))
 
     return open_fixture

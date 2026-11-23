@@ -124,7 +124,9 @@ class ForgeTests(IsolatedAsyncioTestCase):
         trace = await self.try_target(WindowsFixture(screen, self.executor, context()))
         self.assertEqual(screen.actions, 1)
         self.assertEqual(trace[0].verdict, Verdict.UNKNOWN)
-        self.assertIsNone(self.store.record("unknown", "learn", None, "unknown", trace))
+        self.assertEqual(
+            self.store.record("unknown", "learn", None, "unknown", trace), (None, "unknown")
+        )
 
     async def test_identity_change_fails_closed(self):
         class ChangingTarget(WindowsFixture):
@@ -224,6 +226,22 @@ class ForgeTests(IsolatedAsyncioTestCase):
         second = await self.tool.execute({}, ctx)
         self.assertEqual(first, second)
         self.assertEqual(len(self.screens), 1)
+
+    async def test_validation_receipts_survive_promotion(self):
+        await self.invoke("forge learn alpha")
+        wrong = context("forge validate 1 alpha")
+        valid = context("forge validate 1 beta")
+        self.assertFalse((await self.tool.execute({}, wrong)).success)
+        self.assertTrue((await self.tool.execute({}, valid)).success)
+        self.assertTrue((await self.invoke("forge promote 1")).success)
+        # Restore the outcome older writers stored for a repeated marker.
+        with self.store.connection() as db:
+            db.execute(
+                "UPDATE runs SET outcome='success' WHERE outcome='independent_validation_required'"
+            )
+        self.assertFalse((await self.tool.execute({}, wrong)).success)
+        self.assertTrue((await self.tool.execute({}, valid)).success)
+        self.assertEqual(len(self.screens), 3)
 
     async def test_interrupted_delivery_never_reopens_guest(self):
         ctx = context("forge learn alpha")

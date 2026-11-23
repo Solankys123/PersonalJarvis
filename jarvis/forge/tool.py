@@ -15,7 +15,8 @@ from .engine import Evidence, Limits, Procedure, Refused, Verdict, execute
 from .store import Store
 
 NAMESPACE = re.compile(
-    r"^forge\s+(?:learn|list|inspect|validate|promote|replay|stop)\b", re.ASCII | re.IGNORECASE,
+    r"^forge\s+(?:learn|list|inspect|validate|promote|replay|stop)\b",
+    re.ASCII | re.IGNORECASE,
 )
 COMMAND = re.compile(
     r"forge (?:list|stop|learn (?:alpha|beta)|(?:inspect|promote) [1-9][0-9]{0,8}"
@@ -123,7 +124,13 @@ class ForgeMindTool:
             if mode == "replay" and state != "promoted":
                 raise Refused("promoted_version_required")
             if mode == "validate" and state != "draft":
-                raise Refused("draft_required")
+                receipt = await asyncio.to_thread(
+                    self._store.receipt,
+                    self._run_id(ctx, mode, version, params[-1]),
+                )
+                if receipt is None:
+                    raise Refused("draft_required")
+                return await self._result(*receipt)
             if self._active is not None:
                 raise Refused("experiment_already_active")
             return await self._run(mode, version, procedure, params[-1], ctx)
@@ -145,6 +152,10 @@ class ForgeMindTool:
             finally:
                 self._active = None
 
+    @staticmethod
+    def _run_id(ctx: ExecutionContext, mode: str, version: int | None, marker: str) -> str:
+        return hashlib.sha256(f"{ctx.trace_id}:{mode}:{version}:{marker}".encode()).hexdigest()
+
     async def _record_run(
         self,
         mode: str,
@@ -154,11 +165,10 @@ class ForgeMindTool:
         ctx: ExecutionContext,
         token: CancelToken,
     ) -> ToolResult:
-        key = f"{ctx.trace_id}:{mode}:{version}:{marker}"
-        run_id = hashlib.sha256(key.encode()).hexdigest()
+        run_id = self._run_id(ctx, mode, version, marker)
         existing = await asyncio.to_thread(self._store.claim, run_id, mode, version)
         if existing is not None:
-            return await self._result(mode, *existing)
+            return await self._result(*existing)
 
         trace: list[Evidence] = []
         outcome = "interrupted"
@@ -176,7 +186,7 @@ class ForgeMindTool:
             if token.is_cancelled():
                 outcome = "cancelled"
         finally:
-            version = await asyncio.to_thread(
+            version, outcome = await asyncio.to_thread(
                 self._store.record,
                 run_id,
                 mode,
@@ -184,19 +194,15 @@ class ForgeMindTool:
                 outcome,
                 trace,
             )
-        return await self._result(mode, version, outcome)
+        return await self._result(version, outcome)
 
-    async def _result(self, mode: str, version: int | None, outcome: str) -> ToolResult:
+    async def _result(self, version: int | None, outcome: str) -> ToolResult:
         state = None
         if version is not None:
             _, state = await asyncio.to_thread(self._store.get, version)
-        success = outcome == Verdict.SUCCESS and (mode != "validate" or state == "validated")
+        success = outcome == Verdict.SUCCESS
         return ToolResult(
             success,
             {"outcome": outcome, "version": version, "state": state},
-            None
-            if success
-            else "independent_validation_required"
-            if mode == "validate" and outcome == Verdict.SUCCESS
-            else outcome,
+            None if success else outcome,
         )
