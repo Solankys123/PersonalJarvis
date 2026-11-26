@@ -114,7 +114,7 @@ async def test_learn_validate_promote_and_replay_different_marker(workflow):
 
     tool = build()  # New instance reloads the stored schema and history.
     inspected = await tool.execute({}, context("forge inspect 1"))
-    assert inspected.output["procedure"]["schema_version"] == 2
+    assert inspected.output["procedure"]["schema_version"] == 3
     assert not (await tool.execute({}, context("forge validate 1 alpha"))).success
     assert (await tool.execute({}, context("forge validate 1 beta"))).success
     assert (await tool.execute({}, context("forge promote 1"))).success
@@ -250,3 +250,39 @@ async def test_deadline_prevents_starting_any_action(tmp_path):
     assert result.error == "budget_exceeded"
     assert screen.calls == []
     assert store.list() == []
+
+
+@pytest.mark.asyncio
+async def test_improves_after_drift_with_same_fixture_version(workflow):
+    store, screens, build = workflow
+    original = build()
+    assert (await original.execute({}, context("forge learn workflow alpha"))).success
+    assert (await original.execute({}, context("forge validate 1 beta"))).success
+    assert (await original.execute({}, context("forge promote 1"))).success
+
+    changed = build(mode="alternate")
+    assert not (await changed.execute({}, context("forge replay 1 beta"))).success
+    assert screens[-1].calls == ["unlock_b"]
+
+    recovered = await changed.execute({}, context("forge improve 1 alpha"))
+    assert recovered.success
+    assert screens[-1].calls == ["unlock_b", "unlock_a", "enter_marker", "submit"]
+    assert store.get(1)[1] == "promoted"
+    assert store.get(2)[1] == "draft"
+
+
+@pytest.mark.asyncio
+async def test_runs_stored_version_two_procedure(workflow):
+    store, screens, build = workflow
+    tool = build()
+    assert (await tool.execute({}, context("forge learn workflow alpha"))).success
+    with store.connection() as db:
+        row = db.execute("SELECT spec FROM procedures WHERE version=1").fetchone()
+        raw = json.loads(row[0])
+        raw["schema_version"] = 2
+        del raw["fixture_version"]
+        db.execute("UPDATE procedures SET spec=? WHERE version=1", (json.dumps(raw),))
+    assert (await tool.execute({}, context("forge validate 1 beta"))).success
+    assert (await tool.execute({}, context("forge promote 1"))).success
+    assert (await tool.execute({}, context("forge replay 1 beta"))).success
+    assert screens[-1].calls == ["unlock_b", "enter_marker", "submit"]

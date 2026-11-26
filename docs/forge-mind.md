@@ -42,17 +42,39 @@ Use the version returned by the learning command in later commands.
 For the multi-step task, start with `forge learn workflow alpha`, then use
 the same inspection, validation, promotion, and replay commands with its
 returned version. Validate with `beta`. The learner considers only approved
-controls exposed by the guest. It records unchanged rejections and skips
-equivalent rejections for the same marker from the 50 most recent learning
-runs. A fresh guest starts at revision zero. Each successful step advances
+controls exposed by the guest. It records unchanged rejections and uses
+the 50 most recent learning runs to prefer alternatives. Evidence applies
+only to the same fixture, fixture revision, marker, semantic state, and
+action. A historical rejection can be reconsidered once if other choices
+have been exhausted. An equivalent action can run only once per state in
+each exploration. A fresh guest starts at revision zero. Each successful step advances
 exactly one revision and requires independent readback. A stale revision,
 unknown receipt, or unexpected result ends the run.
 
 The workflow uses at most eight action requests and two rejected attempts
 by default. Both limits are configurable under `[forge]`. Procedure schema
-2 stores typed steps and a parameterized goal in the existing SQLite tables.
-Schema 1 procedures remain executable with the original commands. Keep a
-copy of the database when testing a rollback to an older build.
+3 stores variable-length typed steps, a fixture version, and a goal.
+Stored schema 1 and 2 procedures remain executable. SQLite schema 2 adds
+an internal lineage table. Back up the database before testing a rollback
+to a build that predates this migration.
+
+### Improve and roll back a learned workflow
+
+If replay reports drift, run `forge improve VERSION alpha` on the promoted
+workflow. It explores the current fixture in a fresh guest. A changed
+procedure or fixture version is saved as a linked draft. Validate that
+draft with `beta` in another guest, then promote it explicitly. Promotion
+switches the active version to the validated child in one transaction.
+`forge rollback CHILD_VERSION` switches back to its previously validated
+parent. Use the restored version number in the next replay command. Replay
+still refuses a fixture version mismatch after rollback.
+
+The registered receipt goal is available only in the fake-guest tests.
+It verifies its terminal phase, exact marker, and receipt indicator. Its
+fixtures exercise a short path, a reviewed path, and a recovery path with
+an approved Back action. The Windows profile exposes the marker goal.
+Unexpected state or an unconfirmed action stops the run, requiring an
+explicit fresh-guest improvement when the saved version no longer applies.
 
 The action deadline applies after guest acquisition. Windows Sandbox startup
 and teardown are bounded separately by its provider and can take longer.
@@ -96,7 +118,9 @@ python scripts/ci/check_silent_exception_handlers.py
 
 The fake-guest suite exercises learning, independent validation, explicit
 promotion, replay, cancellation and late-guest cleanup, SQLite reload and
-duplicate delivery, and rejection of host or networked targets. The routing
+duplicate delivery, and rejection of host or networked targets. The
+adaptive suite also covers variable-length paths, scoped memory, version
+drift, validated improvement, and rollback. The routing
 tests cover the chat, classic speech, and realtime tool entry points. These
 checks run without launching Windows Sandbox or contacting a model provider.
 

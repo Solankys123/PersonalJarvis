@@ -48,6 +48,7 @@ class FixtureWorkflowAction:
 
 class WindowsFixture:
     kind = FIXTURE
+    fixture_version = 1
     network_enabled = False
 
     def __init__(self, session: Any, executor: Any, context: Any) -> None:
@@ -64,7 +65,7 @@ class WindowsFixture:
 
     async def fingerprint(self) -> tuple[Any, ...]:
         target = await asyncio.to_thread(self._session.foreground)
-        return target.signature() if target.app == FIXTURE and target.handle else ("none",)
+        return target.signature() if target.app == self.kind and target.handle else ("none",)
 
     async def observe(self, marker: str) -> State:
         matched = await self._port.verify_typed_text(MARKERS[marker])

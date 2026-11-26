@@ -57,6 +57,8 @@ class Evidence:
     verdict: Verdict
     reason: str
     attempt: int
+    fixture: str | None = None
+    fixture_version: int | None = None
 
     def record(self) -> dict[str, Any]:
         data = asdict(self)

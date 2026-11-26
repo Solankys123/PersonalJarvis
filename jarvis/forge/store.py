@@ -9,7 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .engine import Evidence, Procedure, Refused, State, Verdict
-from .workflow import Action, Marker, Phase, WorkflowProcedure
+from .workflow import Action, Marker, Observation, RejectionKey, WorkflowProcedure
 
 SCHEMA = """
 BEGIN IMMEDIATE;
@@ -25,9 +25,19 @@ CREATE TABLE IF NOT EXISTS runs (
     outcome TEXT NOT NULL,
     evidence TEXT NOT NULL
 );
-PRAGMA user_version = 1;
+"""
+
+LINEAGE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS skill_lineage (
+    version INTEGER PRIMARY KEY REFERENCES procedures(version),
+    parent INTEGER NOT NULL REFERENCES procedures(version)
+);
+PRAGMA user_version = 2;
 COMMIT;
 """
+
+SCHEMA += LINEAGE_SCHEMA
+MIGRATE_V1 = "BEGIN IMMEDIATE;\n" + LINEAGE_SCHEMA
 
 
 class Store:
@@ -42,7 +52,9 @@ class Store:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
                 db.executescript(SCHEMA)
-            elif version != 1:
+            elif version == 1:
+                db.executescript(MIGRATE_V1)
+            elif version != 2:
                 raise Refused("unsupported_database_version")
             with db:
                 yield db
@@ -69,7 +81,9 @@ class Store:
             if not isinstance(raw, dict):
                 raise ValueError("invalid procedure")
             procedure = (
-                WorkflowProcedure.read(raw) if raw.get("schema_version") == 2 else Procedure(**raw)
+                WorkflowProcedure.read(raw)
+                if raw.get("schema_version") in (2, 3)
+                else Procedure(**raw)
             )
             procedure.validate()
         except (ValueError, TypeError):
@@ -126,18 +140,36 @@ class Store:
                 return None
             return self._receipt(db, run_id)
 
-    def rejected_actions(self, marker: Marker) -> frozenset[tuple[Phase, Action]]:
-        """Reuse only unchanged-state rejections from recent fixture explorations."""
+    def rejected_actions(self, marker: Marker) -> frozenset[RejectionKey]:
+        """Reuse only scoped unchanged-state rejections from recent explorations."""
         with self.connection() as db:
             rows = db.execute(
                 "SELECT evidence FROM runs WHERE mode='learn' ORDER BY rowid DESC LIMIT 50"
             ).fetchall()
         return frozenset(
-            (Phase(step["before"]["phase"]), Action(step["action"]))
+            (
+                (
+                    step["fixture"],
+                    step["fixture_version"],
+                    marker,
+                    Observation.read(step["before"]).state_key(),
+                ),
+                Action(step["action"]),
+            )
             for (raw,) in rows
             for step in json.loads(raw)
-            if step["reason"] == "rejected_unchanged" and step["marker"] == marker
+            if step["reason"] == "rejected_unchanged"
+            and step["marker"] == marker
+            and step.get("fixture")
+            and step.get("fixture_version") is not None
         )
+
+    def parent(self, version: int) -> int | None:
+        with self.connection() as db:
+            row = db.execute(
+                "SELECT parent FROM skill_lineage WHERE version=?", (version,)
+            ).fetchone()
+            return row[0] if row else None
 
     def record(
         self,
@@ -147,6 +179,7 @@ class Store:
         outcome: str,
         evidence: list[Evidence],
         procedure: WorkflowProcedure | None = None,
+        parent: int | None = None,
     ) -> tuple[int | None, str]:
         final = evidence[-1] if evidence else None
         verified = (
@@ -163,12 +196,21 @@ class Store:
             if not verified:
                 outcome = "goal_not_verified"
         with self.connection() as db:
+            if parent is not None and verified:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT state FROM procedures WHERE version=?", (parent,)
+                ).fetchone()
+                if row != ("promoted",):
+                    verified, outcome = False, "active_parent_required"
             if mode == "learn" and verified:
                 row = db.execute(
                     "INSERT INTO procedures(spec,state) VALUES (?, 'draft')",
                     (json.dumps(asdict(procedure if procedure is not None else Procedure())),),
                 )
                 version = row.lastrowid
+                if parent is not None:
+                    db.execute("INSERT INTO skill_lineage VALUES (?, ?)", (version, parent))
             if mode == "validate" and verified:
                 original = self._learning_evidence(db, version)
                 changed = 0
@@ -201,9 +243,56 @@ class Store:
         if not authorized:
             raise Refused("promotion_requires_authorization")
         with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT parent FROM skill_lineage WHERE version=?", (version,)
+            ).fetchone()
+            if row:
+                changed = db.execute(
+                    "UPDATE procedures SET state='validated' WHERE version=? AND state='promoted'",
+                    row,
+                ).rowcount
+                if changed != 1:
+                    raise Refused("active_parent_required")
+            else:
+                active_child = db.execute(
+                    """WITH RECURSIVE descendants(version) AS (
+                        SELECT version FROM skill_lineage WHERE parent=?
+                        UNION
+                        SELECT s.version FROM skill_lineage s
+                        JOIN descendants d ON s.parent=d.version
+                    )
+                    SELECT 1 FROM descendants d JOIN procedures p USING (version)
+                    WHERE p.state='promoted' LIMIT 1""",
+                    (version,),
+                ).fetchone()
+                if active_child:
+                    raise Refused("active_descendant_exists")
             changed = db.execute(
                 "UPDATE procedures SET state='promoted' WHERE version=? AND state='validated'",
                 (version,),
             ).rowcount
             if changed != 1:
                 raise Refused("validated_draft_required")
+
+    def rollback(self, version: int, *, authorized: bool) -> int:
+        if not authorized:
+            raise Refused("rollback_requires_authorization")
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT parent FROM skill_lineage WHERE version=?", (version,)
+            ).fetchone()
+            if row is None:
+                raise Refused("no_prior_version")
+            demoted = db.execute(
+                "UPDATE procedures SET state='validated' WHERE version=? AND state='promoted'",
+                (version,),
+            ).rowcount
+            restored = db.execute(
+                "UPDATE procedures SET state='promoted' WHERE version=? AND state='validated'",
+                row,
+            ).rowcount
+            if demoted != 1 or restored != 1:
+                raise Refused("rollback_version_unavailable")
+            return row[0]
