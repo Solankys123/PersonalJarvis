@@ -60,6 +60,7 @@ BrainCallback = Callable[[str], Awaitable[str]]
 # ``docs/persona-research.md`` Section 2 and keeps the tool set deterministic.
 ROUTER_TOOLS = frozenset({
     "run-shell",
+    "forge-mind",
     "screen-snapshot",
     # NB: ``dispatch-to-harness`` deliberately absent (removed 2026-06-28) —
     # see the header comment above. Heavy work → spawn-worker; desktop →
@@ -486,6 +487,11 @@ def _load_tools_for_tier(
                 # spawn-worker - the society runtime is built by the server
                 # on first use, after the brain exists.
                 inst = cls(runtime_resolver=_resolve_society_runtime)
+            elif ep.name == "forge-mind":
+                forge = getattr(config, "forge", None)
+                if forge is None or not forge.enabled:
+                    continue
+                inst = cls.build(forge, executor)
             elif ep.name == "computer-use":
                 # Wave 1: wraps the harness-dispatch plumbing with a fixed
                 # computer-use harness identity (see computer_use_tool.py).

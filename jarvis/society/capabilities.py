@@ -71,6 +71,8 @@ NEVER_GRANTED: Final[frozenset[str]] = frozenset(
         "find-app-action",
         "run-app-action",
         "create-skill",
+        "forge_mind",
+        "forge-mind",
         "reveal-key-preview",
         "profile-update",
         "society_message_agent",

@@ -1428,3 +1428,12 @@ Mission workers lose the `awareness-recall` grant (ADR-0030).
 - `tests/unit/brain/test_routing.py` (exact router set)
 - `tests/unit/brain/test_evidence_gate.py`, `tests/unit/brain/test_evidence_gate_wiring.py` (honest refusal for the `activity` domain)
 - `tests/missions/test_worker_capability_parity.py` (the worker grant)
+
+## FORGE MIND fixture commands
+
+The opt-in `forge-mind` entry point registers `forge_mind` on the Jarvis
+router. It accepts only the exact current user command and has an empty
+model-facing argument schema. Classic voice and Jarvis chat dispatch exact
+commands through the existing executor before invoking a model. Realtime
+provider sessions can use the tool through the supervisor gateway.
+No FORGE command spawns an agent or grants access to host desktop tools.

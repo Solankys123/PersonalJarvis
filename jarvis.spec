@@ -86,7 +86,7 @@ def _macos_privacy_strings():
 
 # --- Data files -------------------------------------------------------------
 
-datas = []
+datas = [(str(PROJECT_ROOT / "jarvis/agent_screen/runner/sandbox_runner.ps1"), "jarvis/agent_screen/runner")]
 datas.append((str(PROJECT_ROOT / "jarvis/society/browser/live_runner.py"), "jarvis/society/browser"))
 datas.append((str(PROJECT_ROOT / "jarvis/society/browser/native_window.py"), "jarvis/society/browser"))
 datas.append((str(PROJECT_ROOT / "jarvis/society/browser/pointer.py"), "jarvis/society/browser"))

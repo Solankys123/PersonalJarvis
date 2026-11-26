@@ -11292,6 +11292,23 @@ class RealtimeVoiceSession:
                 },
             )
             return
+        forge_turn = self._last_user_text.lstrip().lower().startswith("forge ")
+        if forge_turn or declared_name == "forge_mind":
+            from jarvis.forge.tool import NAMESPACE, command
+
+            if declared_name == "forge_mind":
+                denied = self._turn_trace_id is None or command(self._last_user_text) is None
+            else:
+                denied = declared_name != "end_call" and NAMESPACE.match(
+                    self._last_user_text.lstrip()
+                )
+            if denied:
+                await self._session.send_tool_result(
+                    call_id,
+                    wire_name,
+                    {"success": False, "error": "Only supported FORGE commands may run here."},
+                )
+                return
         if (
             self._delegate_enabled
             and call_id

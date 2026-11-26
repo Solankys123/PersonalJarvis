@@ -2893,6 +2893,15 @@ class ComputerUseConfig(BaseModel):
     native_model: str = "gemini-3-flash-preview"
 
 
+class ForgeConfig(BaseModel):
+    """Opt-in, offline Windows fixture experiments."""
+
+    enabled: bool = False
+    memory_mb: int = Field(default=2048, ge=1536, le=3072)
+    attempts: int = Field(default=2, ge=1, le=3)
+    run_seconds: float = Field(default=25, ge=1, le=60)
+
+
 class LocalActionConfig(BaseModel):
     """Low-latency local action fast path settings."""
 
@@ -4555,6 +4564,7 @@ class JarvisConfig(BaseModel):
     appshot: AppshotConfig = Field(default_factory=AppshotConfig)
     # Phase 5/6 — Computer-Use-POAV-Harness (ADR-0008).
     computer_use: ComputerUseConfig = Field(default_factory=ComputerUseConfig)
+    forge: ForgeConfig = Field(default_factory=ForgeConfig)
     # Low-latency local-action gate. Hidden tools only; never exposed in the
     # router LLM schema.
     local_action: LocalActionConfig = Field(default_factory=LocalActionConfig)
