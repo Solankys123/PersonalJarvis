@@ -623,6 +623,28 @@ export function AgentComposer({ autoFocus = false }: { autoFocus?: boolean }) {
         className={cn("max-h-[50vh] scrollbar-jarvis", minimal ? "min-h-[44px] px-1.5 text-base" : "text-reading")}
       />
       {minimal ? (
+        <details className="px-1.5 text-meta text-muted-foreground">
+          <summary className="cursor-pointer">{t("home.forge_learning")}</summary>
+          <p className="my-2">{t("home.forge_learning_help")}</p>
+          <div className="flex flex-wrap gap-2">
+            {["forge list", "forge learn jobs engineer remote", "forge stop"].map((command) => (
+              <button
+                key={command}
+                type="button"
+                disabled={!connected || Boolean(value.trim()) || files.attachments.length > 0}
+                className="rounded-md border border-border px-2 py-1 font-mono hover:bg-secondary disabled:opacity-50"
+                onClick={() => {
+                  setValue(command);
+                  fieldRef.current?.focus();
+                }}
+              >
+                {command}
+              </button>
+            ))}
+          </div>
+        </details>
+      ) : null}
+      {minimal ? (
         <div className="flex items-center gap-1" data-testid="composer-row">
           <ComposerAddMenu
             key={activeSessionId ?? "new"}

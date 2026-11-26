@@ -226,6 +226,16 @@ describe("ChatStage (agent chat)", () => {
     useHomeStore.setState({ surface: "chat" });
   });
 
+  it("prepares a FORGE command in the active Jarvis composer without sending it", () => {
+    render(<ChatStage />);
+    fireEvent.click(screen.getByText("FORGE learning"));
+    const command = screen.getByRole("button", { name: "forge learn jobs engineer remote" });
+    fireEvent.click(command);
+    expect(screen.getByRole("textbox").textContent).toBe("forge learn jobs engineer remote");
+    expect(useAgentChatStore.getState().timeline.items).toEqual([]);
+    expect((command as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("restores an unsent multiline draft after leaving the chat section", () => {
     const text = "  Draft to finish later\nKeep this second line too.  ";
     const first = render(<ChatStage />);
