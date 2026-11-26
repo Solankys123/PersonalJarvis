@@ -309,6 +309,7 @@ async def run_browser(
             raise Refused("isolated_browser_failed")
         reply = json.loads(stdout)
         if reply in ("interface_drift", "goal_not_verified", "isolated_browser_unavailable"):
+            logger.debug("FORGE browser worker refused the run: %s", reply)
             raise Refused(reply)
         if not isinstance(reply, list) or len(reply) != 2 or not isinstance(reply[1], list):
             raise Refused("isolated_browser_failed")
@@ -367,5 +368,6 @@ def worker() -> None:
         )
         reply: list | str = [procedure.fixture_version, procedure.steps]
     except Refused as exc:
+        # Send the refusal over IPC so the parent can log and record the outcome.
         reply = str(exc)
     sys.stdout.buffer.write(json.dumps(reply).encode("utf-8"))
