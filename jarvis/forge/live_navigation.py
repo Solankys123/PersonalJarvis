@@ -2,10 +2,60 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from .engine import Refused
+from .engine import Evidence, Refused, State, Verdict
+
+LIVE_STEPS = ("navigate", "input_text", "click", "verify_results")
+
+
+@dataclass(frozen=True)
+class LiveSearch:
+    """A fixed public GET search contract with runtime-only URL and query."""
+
+    origin: str
+    result_list: str
+    steps: tuple[str, ...] = LIVE_STEPS
+    schema_version: int = 5
+
+    def validate(self) -> None:
+        if (
+            self.origin != _origin(self.origin)
+            or self.result_list not in ("UL", "OL")
+            or self.steps != LIVE_STEPS
+            or type(self.schema_version) is not int
+            or self.schema_version != 5
+        ):
+            raise Refused("unsupported_live_search")
+
+    def verifies(self, trace: list[Evidence]) -> bool:
+        self.validate()
+        return (
+            tuple(step.action for step in trace) == self.steps
+            and bool(trace[0].target_id)
+            and re.fullmatch(r"length:[0-9]{1,2}", trace[0].marker) is not None
+            and all(
+                step.target_id == trace[0].target_id
+                and step.marker == trace[0].marker
+                and step.before == State.BLANK
+                and step.after == State.MATCH
+                and step.verdict == Verdict.SUCCESS
+                and step.reason == "verified"
+                and step.attempt == index
+                for index, step in enumerate(trace, 1)
+            )
+        )
+
+
+def search_origin(url: str, query: str) -> str:
+    origin = _origin(url)
+    if not url.startswith(origin + "/") or "?" in url or "#" in url:
+        raise Refused("public_search_start_url_required")
+    if not re.fullmatch(r"[A-Za-z]{2,24}(?: [A-Za-z]{2,24}){0,3}", query):
+        raise Refused("public_search_words_required")
+    return origin
 
 
 @dataclass(frozen=True)

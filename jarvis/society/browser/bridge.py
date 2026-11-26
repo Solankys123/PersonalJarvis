@@ -82,7 +82,14 @@ async def wait_for_browser_approval(runtime: Any, approval_id: str, session: Any
 
 
 async def execute_live(
-    runtime: Any, caller: Any, jobs: Any, args: dict, ctx: Any, *, read_only: bool = False
+    runtime: Any,
+    caller: Any,
+    jobs: Any,
+    args: dict,
+    ctx: Any,
+    *,
+    read_only: bool = False,
+    public_search: dict | None = None,
 ) -> ToolResult:
     from jarvis.core.config import get_jarvis_agent_secret, override_provider_secrets
 
@@ -103,30 +110,32 @@ async def execute_live(
     if (caller.agent_id, turn_trace) in live.stopped_turns:
         return ToolResult(False, None, stopped_message)
     executor = live.executor() if callable(live.executor) else live.executor
-    if live.model_resolver is None or executor is None:
+    if executor is None or (public_search is None and live.model_resolver is None):
         return ToolResult(False, None, "Browser model service is not ready")
-    provider = caller.provider or _default_provider(runtime)
-    key = get_jarvis_agent_secret(provider)
-    overrides = {provider: key} if key else {}
-    try:
-        with override_provider_secrets(overrides):
-            brain = await asyncio.to_thread(live.model_resolver, caller)
-    except LookupError:
-        # A chat-only CLI can be connected without an inference implementation.
-        # Do not silently move its browser work to an API-billed provider.
-        return ToolResult(
-            False,
-            None,
-            "This agent's selected model connection cannot currently drive the browser. "
-            "Choose another connected model in its Model menu.",
-        )
-    if brain is None or not callable(getattr(brain, "complete", None)):
-        return ToolResult(False, None, "This agent has no browser-capable model connection")
+    brain, provider, overrides = None, None, {}
+    if public_search is None:
+        provider = caller.provider or _default_provider(runtime)
+        key = get_jarvis_agent_secret(provider)
+        overrides = {provider: key} if key else {}
+        try:
+            with override_provider_secrets(overrides):
+                brain = await asyncio.to_thread(live.model_resolver, caller)
+        except LookupError:
+            # A chat-only CLI must not fall back to an API-billed provider.
+            return ToolResult(
+                False,
+                None,
+                "This agent's selected model connection cannot currently drive the browser. "
+                "Choose another connected model in its Model menu.",
+            )
+        if brain is None or not callable(getattr(brain, "complete", None)):
+            return ToolResult(False, None, "This agent has no browser-capable model connection")
     usage_total = {"input_tokens": 0, "output_tokens": 0, "cache_hit_tokens": 0}
     vision_available = bool(getattr(brain, "supports_vision", False))
 
     async def llm(payload: dict) -> dict:
         nonlocal vision_available
+        assert brain is not None
         all_messages = brain_messages(payload["messages"])
         messages = tuple(m for m in all_messages if m.role != "system")
         schema = payload.get("schema")
@@ -187,6 +196,13 @@ async def execute_live(
         return {"ok": True, "text": text, "usage": usage}
 
     denied = False
+    verified_actions: list[str] = []
+    search_actions = {
+        "navigate": "Open public search",
+        "input_text": "Fill the public search field",
+        "click": "Submit the public search form",
+        "verify_results": "Verify the displayed search results",
+    }
 
     async def action(payload: dict) -> dict:
         nonlocal denied
@@ -207,6 +223,16 @@ async def execute_live(
         parameters = proposal[name]
         if not isinstance(parameters, dict):
             return {"ok": False, "error": "Invalid browser action parameters"}
+        if public_search is not None:
+            expected = {"url": public_search["origin"]} if name == "navigate" else {}
+            if (
+                name not in search_actions
+                or parameters != expected
+                or payload.get("url") != public_search["origin"]
+                or payload.get("confirm") is not True
+            ):
+                denied = True
+                return {"ok": False, "error": "Unexpected FORGE search action"}
         target_url = parameters.get("url")
         if target_url and urlsplit(str(target_url)).scheme not in {"http", "https"}:
             denied = True
@@ -238,6 +264,8 @@ async def execute_live(
             "done",
             "wait",
         }
+        if public_search is not None:
+            read_actions.add("verify_results")
         if read_only and name not in read_actions:
             denied = True
             return {
@@ -251,12 +279,13 @@ async def execute_live(
             return {"ok": False, "error": "Browser action blocked by agent policy"}
         trace = getattr(ctx, "trace_id", uuid4())
         if verdict is Verdict.QUEUE:
+            description = search_actions[name] if public_search is not None else name
             approval = await runtime.approvals.enqueue(
                 agent_id=caller.agent_id,
                 trace_id=str(trace),
                 capability="core:browser",
                 action={"action": proposal, "resume_in_place": True},
-                summary=f"Browser: {name} on {payload.get('url', '')}"[:300],
+                summary=f"Browser: {description} on {payload.get('url', '')}"[:300],
             )
             session = live.sessions.get(caller.agent_id)
             if session:
@@ -265,13 +294,18 @@ async def execute_live(
                 denied = True
                 live.stop_turn(caller.agent_id, turn_trace)
                 return {"ok": False, "error": stopped_message}
+        utterance = "FORGE public search" if public_search else getattr(ctx, "user_utterance", "")
         result = await executor.execute(
             ApprovedBrowserAction(payload["apply"], read_only=read_only),
             {"action": proposal},
-            user_utterance=getattr(ctx, "user_utterance", ""),
+            user_utterance=utterance,
             trace_id=trace if isinstance(trace, UUID) else uuid4(),
             config_snapshot=getattr(ctx, "config", {}),
         )
+        if public_search is not None and result.success:
+            if result.output != {"verified_action": name}:
+                return {"ok": False, "error": "Missing browser action evidence"}
+            verified_actions.append(name)
         return {"ok": result.success, "error": result.error}
 
     task = str(args.get("task") or "").strip()
@@ -294,19 +328,32 @@ async def execute_live(
             caller,
             task=task,
             max_steps=max(1, min(int(args.get("max_steps") or 25), 60)),
-            llm=llm,
+            llm=llm if public_search is None else None,
             action=action,
             vision=bool(getattr(brain, "supports_vision", False)),
             files=files,
             trace_id=turn_trace,
             chat_session_id=chat_session_id,
+            **({"public_search": public_search} if public_search is not None else {}),
         )
     except Exception as exc:
         # The tool result reports the failure to both the chat and the planner.
         return ToolResult(
             False,
             None,
-            stopped_message if (caller.agent_id, turn_trace) in live.stopped_turns else str(exc),
+            stopped_message
+            if (caller.agent_id, turn_trace) in live.stopped_turns
+            else "browser_search_unavailable"
+            if public_search is not None
+            else str(exc),
+        )
+    if public_search is not None:
+        return ToolResult(
+            bool(result.get("ok")),
+            {**result, "actions": verified_actions},
+            "browser_search_stopped"
+            if (caller.agent_id, turn_trace) in live.stopped_turns
+            else result.get("error"),
         )
     result["usage"] = usage_total
     result["provider"] = provider

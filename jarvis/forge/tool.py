@@ -1,4 +1,4 @@
-"""Jarvis tool and command vocabulary for the local FORGE fixture."""
+"""Jarvis tool and command vocabulary for FORGE procedures."""
 
 from __future__ import annotations
 
@@ -13,7 +13,8 @@ from jarvis.control.cancel import CancelScope, CancelToken, get_kill_switch
 from jarvis.core.protocols import ExecutionContext, ToolResult
 
 from .browser import EXPECTED, BrowserProcedure, Search, run_browser
-from .engine import Evidence, Limits, Procedure, Refused, Verdict, execute
+from .engine import Evidence, Limits, Procedure, Refused, State, Verdict, execute
+from .live_navigation import LIVE_STEPS, LiveSearch, search_origin
 from .store import Store
 from .workflow import Goal, Marker, WorkflowProcedure, run_workflow
 
@@ -31,10 +32,23 @@ COMMAND = re.compile(
     rf"|(?:validate|replay|improve) [1-9][0-9]{{0,8}} (?:alpha|beta|{JOB_PARAMETERS}))[.!]?",
     re.ASCII | re.IGNORECASE,
 )
+WEB_COMMAND = re.compile(
+    r"forge (?:(learn) web|(validate|replay) ([1-9][0-9]{0,8}) web) "
+    r"(\S{1,2048}) ([A-Za-z ]{2,99})",
+    re.ASCII | re.IGNORECASE,
+)
 
 
 def command(text: str) -> tuple[str, ...] | None:
     text = text.strip()
+    web = WEB_COMMAND.fullmatch(text)
+    if web:
+        learn, mode, version, url, query = web.groups()
+        return (
+            (learn.lower(), "web", url, query)
+            if learn
+            else (mode.lower(), version, "web", url, query)
+        )
     if not COMMAND.fullmatch(text):
         return None
     return tuple(text.rstrip(".!").lower().split()[1:])
@@ -64,6 +78,11 @@ def render_result(result: ToolResult) -> str:
                 reply + f" It searches fixture revision {spec['fixture_version']} by job role "
                 "and work location, then verifies the displayed results." + recent
             )
+        if spec.get("schema_version") == 5:
+            actions = ", ".join(step.replace("_", " ") for step in spec["steps"])
+            failures = result.output["recent_failures"]
+            recent = f" Recent failures: {', '.join(failures)}." if failures else ""
+            return reply + f" Verified public search steps are {actions}." + recent
         if spec.get("schema_version") in (2, 3):
             actions = ", ".join(step["action"].replace("_", " ") for step in spec["steps"])
             return reply + f" Verified workflow steps are {actions}."
@@ -82,6 +101,9 @@ class ForgeMindTool:
         "forge promote VERSION, forge replay VERSION alpha, forge learn workflow alpha. "
         "For the local job fixture use forge learn jobs engineer remote, or give a "
         "role and location after a version when validating, replaying, or improving. "
+        "In Agent Chat use forge learn web URL QUERY to learn a supported public search, "
+        "then forge validate VERSION web URL QUERY with a different-length query. "
+        "After promotion, use forge replay VERSION web URL QUERY. "
         "Use forge improve VERSION alpha to explore a new draft, or forge rollback VERSION "
         "to restore the previous validated version. The user utterance supplies the command."
     )
@@ -143,7 +165,7 @@ class ForgeMindTool:
             if mode == "inspect":
                 assert version is not None
                 details = {}
-                if isinstance(procedure, BrowserProcedure):
+                if isinstance(procedure, (BrowserProcedure, LiveSearch)):
                     details["recent_failures"] = await asyncio.to_thread(
                         self._store.browser_failures, version
                     )
@@ -167,6 +189,13 @@ class ForgeMindTool:
                 assert version is not None
                 restored = await asyncio.to_thread(self._store.rollback, version, authorized=True)
                 return ToolResult(True, f"FORGE procedure {restored} restored.")
+            if params[0 if mode == "learn" else 1] == "web":
+                if mode != "learn" and not isinstance(procedure, LiveSearch):
+                    raise Refused("live_search_procedure_required")
+                saved = procedure if isinstance(procedure, LiveSearch) else None
+                return await self._run_live_search(mode, version, saved, state, *params[-2:], ctx)
+            if isinstance(procedure, LiveSearch):
+                raise Refused("public_search_parameters_required")
             if isinstance(procedure, BrowserProcedure) or (mode == "learn" and params[0] == "jobs"):
                 if len(params) != 3:
                     raise Refused("job_search_parameters_required")
@@ -201,6 +230,125 @@ class ForgeMindTool:
         except Refused as exc:
             logger.debug("FORGE command refused; returning a controlled result")
             return ToolResult(False, None, str(exc))
+
+    async def _run_live_search(
+        self,
+        mode: str,
+        version: int | None,
+        procedure: LiveSearch | None,
+        state: str,
+        url: str,
+        query: str,
+        ctx: ExecutionContext,
+    ) -> ToolResult:
+        from jarvis.society.browser.bridge import execute_live
+        from jarvis.society.runtime import current_runtime
+
+        if ctx.config.get("forge_interactive") is not True or not str(
+            ctx.config.get("approval_ref", "")
+        ).startswith("agent-chat:"):
+            raise Refused("agent_chat_required")
+        origin = search_origin(url, query)
+        if procedure is not None and procedure.origin != origin:
+            raise Refused("browser_origin_mismatch")
+        run_id = self._run_id(ctx, mode, version, "web")
+        receipt = await asyncio.to_thread(self._store.receipt, run_id)
+        if receipt is not None:
+            return await self._result(*receipt)
+        if mode == "validate" and state != "draft":
+            raise Refused("draft_required")
+        if mode == "replay" and state != "promoted":
+            raise Refused("promoted_version_required")
+        if self._limits.actions < len(LIVE_STEPS):
+            raise Refused("action_budget_exceeded")
+        if self._active is not None:
+            raise Refused("experiment_already_active")
+        runtime = current_runtime()
+        if runtime is None or runtime.browser._python is not None:
+            raise Refused("managed_browser_required")
+        async with CancelScope(get_kill_switch(), holder="forge") as token:
+            self._active = token
+            try:
+                caller = await runtime.roster.get(runtime.lead_id)
+                if caller is None or str(caller.state) != "active":
+                    raise Refused("browser_agent_unavailable")
+                old = await asyncio.to_thread(self._store.claim, run_id, mode, version)
+                if old is not None:
+                    return await self._result(*old)
+                outcome = "interrupted"
+                evidence: list[Evidence] = []
+                try:
+                    async with asyncio.timeout(self._limits.seconds):
+                        async with asyncio.TaskGroup() as group:
+                            run = group.create_task(
+                                execute_live(
+                                    runtime,
+                                    caller,
+                                    runtime.browser,
+                                    {},
+                                    ctx,
+                                    public_search={
+                                        "origin": origin,
+                                        "url": url,
+                                        "query": query,
+                                        "result_list": procedure.result_list if procedure else None,
+                                    },
+                                )
+                            )
+                            cancel = group.create_task(token.wait_until_cancelled())
+                            await asyncio.wait((run, cancel), return_when=asyncio.FIRST_COMPLETED)
+                            if token.is_cancelled():
+                                run.cancel()
+                            cancel.cancel()
+                        if token.is_cancelled():
+                            raise Refused("cancelled")
+                        result = run.result()
+                    if not result.success:
+                        raise Refused(
+                            result.error
+                            if result.error in {"search_page_drift", "browser_search_stopped"}
+                            else "browser_search_unavailable"
+                        )
+                    raw = result.output
+                    if not re.fullmatch(r"[0-9a-f]{32}", raw.get("target_id", "")):
+                        raise Refused("missing_browser_evidence")
+                    observed = LiveSearch(origin, raw.get("result_list"), tuple(raw["actions"]))
+                    observed.validate()
+                    if procedure is not None and procedure != observed:
+                        raise Refused("search_page_drift")
+                    procedure = observed
+                    # Length is enough to prove that validation exercised different input.
+                    # No query, query hash, page path, or page text enters the store.
+                    evidence = [
+                        Evidence(
+                            raw["target_id"],
+                            step,
+                            f"length:{len(query)}",
+                            State.BLANK,
+                            State.MATCH,
+                            Verdict.SUCCESS,
+                            "verified",
+                            index,
+                        )
+                        for index, step in enumerate(observed.steps, 1)
+                    ]
+                    outcome = Verdict.SUCCESS
+                except TimeoutError:
+                    outcome = "budget_exceeded"
+                except asyncio.CancelledError:
+                    outcome = "cancelled"
+                    raise
+                except Refused as exc:
+                    outcome = str(exc)
+                finally:
+                    if token.is_cancelled():
+                        outcome = "cancelled"
+                    saved = await asyncio.to_thread(
+                        self._store.record, run_id, mode, version, outcome, evidence, procedure
+                    )
+                return await self._result(*saved)
+            finally:
+                self._active = None
 
     async def _run_browser(
         self,

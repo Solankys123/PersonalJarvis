@@ -79,6 +79,7 @@ class Worker:
         self.page: Any = None
         self.playwright: Any = None
         self.agent: Any = None
+        self.public_search = False
         self.job: asyncio.Task | None = None
         self.stream: asyncio.Task | None = None
         self.state_task: asyncio.Task | None = None
@@ -150,35 +151,17 @@ class Worker:
                 service_workers="block",
                 args=["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"],
             )
-        private_hosts = {
+        self.private_hosts = {
             str(pattern).split("://")[-1].split("/")[0]
             for pattern in args.get("allowed_domains", [])
             if "*" not in str(pattern).split("://")[-1]
         }
 
         async def route_request(route: Any) -> None:
-            parsed = urlsplit(route.request.url)
-            host = parsed.hostname or ""
-            if parsed.scheme not in {"http", "https"}:
+            if await self.allowed_destination(route.request.url):
+                await route.continue_()
+            else:
                 await route.abort()
-                return
-            if host not in private_hosts:
-                try:
-                    addresses = await asyncio.get_running_loop().getaddrinfo(
-                        host,
-                        parsed.port or (443 if parsed.scheme == "https" else 80),
-                        type=socket.SOCK_STREAM,
-                    )
-                    if not addresses or any(
-                        not ipaddress.ip_address(a[4][0]).is_global for a in addresses
-                    ):
-                        await route.abort()
-                        return
-                except (OSError, ValueError):
-                    # An unresolved or invalid destination is denied at the network boundary.
-                    await route.abort()
-                    return
-            await route.continue_()
 
         if self.owns_context:
             await self.context.route("**/*", route_request)
@@ -242,6 +225,26 @@ class Worker:
             "protocol": PROTOCOL_VERSION,
             "full_window": bool(self.native),
         }
+
+    async def allowed_destination(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        host = parsed.hostname or ""
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        if host in self.private_hosts:
+            return True
+        try:
+            addresses = await asyncio.get_running_loop().getaddrinfo(
+                host,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+            return bool(addresses) and all(
+                ipaddress.ip_address(address[4][0]).is_global for address in addresses
+            )
+        except (OSError, ValueError):
+            # Unresolved and invalid destinations are denied at the network boundary.
+            return False
 
     async def launch_context(self, profile: str, **options: Any) -> Any:
         """Chrome may release its profile mutex just after its parent exits."""
@@ -641,8 +644,12 @@ class Worker:
         if op == "cancel":
             if self.job and not self.job.done():
                 self.job.cancel()
+                if self.public_search:
+                    await self.job
             return {}
         if op == "takeover":
+            if self.public_search:
+                raise RuntimeError("Stop the FORGE search before taking control")
             self.takeover_generation += 1
             generation = self.takeover_generation
             if args.get("enabled"):
@@ -677,6 +684,14 @@ class Worker:
         if op == "run":
             if self.manual:
                 raise RuntimeError("Return browser control to the agent first")
+            if args.get("public_search") is not None:
+                from public_search import run_search  # type: ignore[import-not-found]
+
+                self.public_search = True
+                try:
+                    return await run_search(self, args["public_search"], emit)
+                finally:
+                    self.public_search = False
             return await self.run(args)
         if op == "shutdown":
             self.closed = True

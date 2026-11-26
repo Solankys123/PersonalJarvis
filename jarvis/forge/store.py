@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .browser import BrowserProcedure, BrowserStep
 from .engine import Evidence, Procedure, Refused, State, Verdict
+from .live_navigation import LiveSearch
 from .workflow import Action, Marker, Observation, RejectionKey, WorkflowProcedure
 
 SCHEMA = """
@@ -69,7 +70,9 @@ class Store:
                 )
             ]
 
-    def get(self, version: int) -> tuple[Procedure | WorkflowProcedure | BrowserProcedure, str]:
+    def get(
+        self, version: int
+    ) -> tuple[Procedure | WorkflowProcedure | BrowserProcedure | LiveSearch, str]:
         with self.connection() as db:
             row = db.execute(
                 "SELECT spec, state FROM procedures WHERE version=?",
@@ -81,7 +84,10 @@ class Store:
             raw = json.loads(row[0])
             if not isinstance(raw, dict):
                 raise ValueError("invalid procedure")
-            if type(raw.get("schema_version")) is int and raw["schema_version"] == 4:
+            if type(raw.get("schema_version")) is int and raw["schema_version"] == 5:
+                raw["steps"] = tuple(raw["steps"])
+                procedure = LiveSearch(**raw)
+            elif type(raw.get("schema_version")) is int and raw["schema_version"] == 4:
                 raw["steps"] = tuple(map(BrowserStep, raw["steps"]))
                 procedure = BrowserProcedure(**raw)
             elif raw.get("schema_version") in (2, 3):
@@ -192,7 +198,7 @@ class Store:
         version: int | None,
         outcome: str,
         evidence: list[Evidence],
-        procedure: WorkflowProcedure | BrowserProcedure | None = None,
+        procedure: WorkflowProcedure | BrowserProcedure | LiveSearch | None = None,
         parent: int | None = None,
     ) -> tuple[int | None, str]:
         final = evidence[-1] if evidence else None
@@ -210,7 +216,7 @@ class Store:
             if not verified:
                 outcome = "goal_not_verified"
         with self.connection() as db:
-            if isinstance(procedure, BrowserProcedure) and verified:
+            if isinstance(procedure, (BrowserProcedure, LiveSearch)) and verified:
                 db.execute("BEGIN IMMEDIATE")
             if parent is not None and verified:
                 if not db.in_transaction:
@@ -223,7 +229,7 @@ class Store:
             if mode == "learn" and verified:
                 spec = json.dumps(asdict(procedure if procedure is not None else Procedure()))
                 duplicate = None
-                if isinstance(procedure, BrowserProcedure):
+                if isinstance(procedure, (BrowserProcedure, LiveSearch)):
                     duplicate = db.execute(
                         "SELECT p.version FROM procedures p "
                         "LEFT JOIN skill_lineage l USING (version) "

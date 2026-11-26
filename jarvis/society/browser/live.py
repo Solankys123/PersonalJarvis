@@ -144,8 +144,9 @@ class LiveSession:
         except Exception as exc:
             log.warning("Browser RPC failed: %s", type(exc).__name__, exc_info=True)
             answer = {"ok": False, "error": str(exc)[:1000]}
-        if not self.closed and not applied:
-            await self.send({"kind": "rpc_result", "id": event["id"], **answer})
+        if not self.closed and (not applied or event["payload"].get("confirm") is True):
+            reply_id = event["id"] + ":result" if applied else event["id"]
+            await self.send({"kind": "rpc_result", "id": reply_id, **answer})
 
     async def read(self) -> None:
         assert self.proc.stdout is not None
@@ -495,19 +496,22 @@ class LiveSessions:
         *,
         task: str,
         max_steps: int,
-        llm: RPC,
+        llm: RPC | None,
         action: RPC,
         vision: bool = True,
         files: list[str] | None = None,
         trace_id: str = "",
         chat_session_id: str = "",
+        public_search: dict | None = None,
     ) -> dict:
         session = await self.ensure(agent)
         await claim_browser(session, chat_session_id)
         if session.run_lock.locked() or session.control_owner:
             raise RuntimeError(_BUSY)
         async with session.run_lock:
-            session.rpc = {"llm": llm, "action": action}
+            session.rpc = {"action": action}
+            if llm is not None:
+                session.rpc["llm"] = llm
             session.rpc_context = contextvars.copy_context()
             session.active_trace = trace_id
             session.active_chat = chat_session_id
@@ -520,6 +524,7 @@ class LiveSessions:
                         "model": agent.model,
                         "vision": vision,
                         "files": files or [],
+                        **({"public_search": public_search} if public_search is not None else {}),
                     },
                     timeout=600,
                 )
