@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -13,6 +14,8 @@ from jarvis.agent_screen.providers.windows_sandbox import WindowsSandboxProvider
 from jarvis.agent_screen.tools import screen_bound_tools
 
 from .engine import FIXTURE, MARKERS, Refused, State
+
+logger = logging.getLogger(__name__)
 
 
 class WindowsFixture:
@@ -66,6 +69,7 @@ async def _finish_owned_task(task: asyncio.Task) -> None:
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError as exc:
+            logger.debug("FORGE cancellation deferred until owned guest cleanup completes")
             cancellation = exc
     task.result()
     if cancellation is not None:
@@ -92,12 +96,14 @@ def fixture_factory(executor: Any, *, memory_mb: int):
                 try:
                     lease = await pending
                 except (AgentScreenUnavailable, OSError):
+                    logger.debug("FORGE sandbox did not start after cancellation")
                     return
                 await manager.release(lease)
 
             await _finish_owned_task(asyncio.create_task(release_after_start()))
             raise
         except (AgentScreenUnavailable, OSError):
+            logger.warning("FORGE sandbox unavailable; experiment stopped before execution")
             raise Refused("sandbox_unavailable") from None
         try:
             yield WindowsFixture(lease.session, executor, context)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import re
 from dataclasses import asdict
 from typing import Any
@@ -13,6 +14,8 @@ from jarvis.core.protocols import ExecutionContext, ToolResult
 
 from .engine import Evidence, Limits, Procedure, Refused, Verdict, execute
 from .store import Store
+
+logger = logging.getLogger(__name__)
 
 NAMESPACE = re.compile(
     r"^forge\s+(?:learn|list|inspect|validate|promote|replay|stop)\b",
@@ -135,6 +138,7 @@ class ForgeMindTool:
                 raise Refused("experiment_already_active")
             return await self._run(mode, version, procedure, params[-1], ctx)
         except Refused as exc:
+            logger.debug("FORGE command refused; returning a controlled result")
             return ToolResult(False, None, str(exc))
 
     async def _run(
@@ -180,8 +184,10 @@ class ForgeMindTool:
                 if trace and trace[-1].reason == "already_matched" and mode != "replay":
                     outcome = "no_new_evidence"
             except Refused as exc:
+                logger.debug("FORGE run stopped by a target, policy, or cancellation check")
                 outcome = str(exc)
             except TimeoutError:
+                logger.warning("FORGE run timed out; recording an unresolved outcome")
                 outcome = "budget_exceeded"
             if token.is_cancelled():
                 outcome = "cancelled"
