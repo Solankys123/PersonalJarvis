@@ -605,8 +605,20 @@ class AgentChatService:
             raise NoSuchSession(session_id)
         if session.surface == "society":
             session = await self.bind_society_session(session_id, routine_run=routine_run)
+        forge_command = False
+        if (
+            session.surface == "jarvis"
+            and direct_user
+            and incoming is None
+            and not control_owned
+            and control_runner is None
+            and text.lstrip()[:5].lower() == "forge"
+        ):
+            from jarvis.forge.tool import NAMESPACE
+
+            forge_command = NAMESPACE.match(text.lstrip()) is not None
         selected_runner = None
-        if session.surface == "jarvis":
+        if session.surface == "jarvis" and not forge_command:
             from jarvis.core.task_agent import subscription_seat_off_loop
 
             # The saved chat pick is authoritative. Global worker preferences
@@ -633,7 +645,7 @@ class AgentChatService:
             command = re.match(r"^/([a-z]+)(?:\s|$)", text.strip())
             if command and command[1] in {row["name"] for row in COMMANDS}:
                 raise ValueError("Use the chat command endpoint for slash commands")
-            if hasattr(self, "_controls"):
+            if not forge_command and hasattr(self, "_controls"):
                 await self._controls.user_message(session_id, text)
         if read_only:
             session = replace(session, permission_mode="plan")
@@ -643,7 +655,7 @@ class AgentChatService:
         ):
             from .control import supports_restricted_turn
 
-            if not supports_restricted_turn(session):
+            if not forge_command and not supports_restricted_turn(session):
                 raise ValueError("This runner cannot enforce read-only mode; choose an API model")
         if incoming is not None:
             receipt = await self.receive_message(session_id, incoming)
@@ -669,7 +681,7 @@ class AgentChatService:
         ):
             tool_choices = list(dict.fromkeys([*(tool_choices or []), "tool:society_browser"]))
         selected = []
-        if tool_choices:
+        if tool_choices and not forge_command:
             if session.surface != "jarvis":
                 raise ValueError("Tool selections are supported by the Jarvis chat")
             from jarvis.agent_chat.runner_brain import brain_manager
@@ -744,7 +756,11 @@ class AgentChatService:
                     },
                 ),
             )
-        runner = selected_runner or resolve_runner(session.provider, surface=session.surface)
+        runner = (
+            "brain"
+            if forge_command
+            else selected_runner or resolve_runner(session.provider, surface=session.surface)
+        )
         await self._emit(
             session_id,
             make_event(
@@ -815,6 +831,16 @@ class AgentChatService:
                     vendor = await control_runner(run_handle, text)
                     if vendor:
                         self.store.update_session(session_id, vendor_session=vendor)
+                elif forge_command:
+                    # The FORGE tool owns its active run. A stop from another
+                    # chat must be able to reach it while that run is in progress.
+                    await run_brain_turn(
+                        run_handle,
+                        text,
+                        bridge=self._bridge_for(bus),
+                        always_allowed=self.always_allowed(session_id),
+                        forge_command=True,
+                    )
                 elif runner == "brain":
                     async with self._brain_lock:
                         await run_brain_turn(
@@ -939,7 +965,7 @@ class AgentChatService:
                     ),
                 )
                 current_chat_turn.reset(origin_token)
-                if kit.turn_completed is not None:
+                if not forge_command and kit.turn_completed is not None:
                     try:
                         first_seq = max(
                             (int(e.get("seq") or 0) for e in history), default=history_start
@@ -956,7 +982,7 @@ class AgentChatService:
                     if fut is not None and not fut.done():
                         fut.set_result("cancel")
                 self._cancel_questions(session_id)
-                if hasattr(self, "_controls"):
+                if not forge_command and hasattr(self, "_controls"):
                     await self._controls.turn_completed(
                         session_id, turn_id, origin.user_text, origin.direct_user, read_only
                     )

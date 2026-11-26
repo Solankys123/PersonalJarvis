@@ -545,6 +545,80 @@ def test_routes_catalog_sessions_and_websocket_snapshot(tmp_path: Path, scripted
         _exercise_routes(client, tmp_path)
 
 
+@pytest.mark.parametrize(
+    ("provider", "mode", "enabled", "registered", "text", "reply"),
+    [
+        ("openai-codex", "ask", True, True, "forge list", "No FORGE procedures have been saved."),
+        (
+            "openai-codex", "ask", True, True, "forge learn jobs engineer remote",
+            "FORGE stopped (isolated_browser_unavailable).",
+        ),
+        ("openai-codex", "ask", False, False, "forge list", "FORGE is disabled."),
+        ("openai-codex", "ask", True, False, "forge list", "FORGE is unavailable"),
+        (
+            "openai-codex", "plan", True, True, "forge learn jobs engineer remote",
+            "FORGE is unavailable in this chat mode.",
+        ),
+        ("openai", "ask", True, True, "forge\tlist", "FORGE command unsupported."),
+    ],
+)
+def test_jarvis_composer_routes_forge_before_provider(
+    tmp_path, monkeypatch, provider, mode, enabled, registered, text, reply
+):
+    from jarvis.brain.manager import BrainManager
+    from jarvis.core.bus import EventBus
+    from jarvis.core.config import JarvisConfig
+    from jarvis.forge.engine import Limits, Refused
+    from jarvis.forge.store import Store
+    from jarvis.forge.tool import ForgeMindTool
+    from jarvis.safety.approval import ApprovalWorkflow
+    from jarvis.safety.risk_tier import RiskTierEvaluator
+    from jarvis.safety.tool_executor import ToolExecutor
+
+    async def unexpected_dispatch(*args, **kwargs):
+        pytest.fail("FORGE reached an external runner")
+
+    async def no_browser(*args, **kwargs):
+        raise Refused("isolated_browser_unavailable")
+
+    config = JarvisConfig()
+    config.forge.enabled = enabled
+    bus = EventBus()
+    executor = ToolExecutor(bus, RiskTierEvaluator(config.safety), ApprovalWorkflow(bus))
+    tool = ForgeMindTool(Store(tmp_path / "forge.sqlite"), unexpected_dispatch, Limits())
+    brain = BrainManager(
+        config, bus, tools={tool.name: tool} if registered else {}, tool_executor=executor
+    )
+    monkeypatch.setattr("jarvis.agent_chat.runner_brain.brain_manager", lambda: brain)
+    monkeypatch.setattr("jarvis.agent_chat.service.run_cli_turn", unexpected_dispatch)
+    monkeypatch.setattr("jarvis.agent_chat.service.run_api_turn", unexpected_dispatch)
+    monkeypatch.setattr("jarvis.core.task_agent.subscription_seat_off_loop", unexpected_dispatch)
+    monkeypatch.setattr("jarvis.forge.tool.run_browser", no_browser)
+    monkeypatch.setattr(brain, "_generate", unexpected_dispatch)
+
+    with TestClient(_app(tmp_path)) as client:
+        created = client.post(
+            "/api/agent-chat/sessions",
+            json={"surface": "jarvis", "provider": provider, "permission_mode": mode},
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["permission_mode"] == mode
+        url = f"/api/agent-chat/sessions/{created.json()['session_id']}"
+        with client.websocket_connect(f"{url}/ws") as ws:
+            assert ws.receive_json()["type"] == "snapshot"
+            sent = client.post(f"{url}/messages", json={"text": text})
+            assert sent.status_code == 202, sent.text
+            events = {}
+            while "turn_finished" not in events:
+                frame = ws.receive_json()
+                if frame["type"] == "event":
+                    events[frame["event"]["kind"]] = frame["event"]["payload"]
+        assert events["turn_started"]["provider"] == provider
+        assert events["turn_started"]["runner"] == "brain"
+        assert events["turn_finished"]["status"] == "done"
+        assert events["assistant_text"]["text"].startswith(reply)
+
+
 def _exercise_routes(client: TestClient, tmp_path: Path) -> None:
 
     cat = client.get("/api/agent-chat/catalog").json()

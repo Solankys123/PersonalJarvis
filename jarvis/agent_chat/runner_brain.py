@@ -30,6 +30,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, get_args
 
@@ -413,6 +414,7 @@ async def run_brain_turn(
     bridge: ChatApprovalBridge | None,
     always_allowed: set[str],
     tool_choices: list[ToolChoice] | None = None,
+    forge_command: bool = False,
 ) -> None:
     """Run one typed turn on Jarvis' brain, streaming it into the timeline."""
     started = time.monotonic()
@@ -441,13 +443,21 @@ async def run_brain_turn(
     brain = brain_manager()
     if brain is None or not callable(getattr(brain, "generate", None)):
         await finish(
-            "error", {}, "Jarvis' brain is still starting up. Give it a moment and send again."
+            "error",
+            {},
+            "FORGE is unavailable while Jarvis is starting up."
+            if forge_command
+            else "Jarvis' brain is still starting up. Give it a moment and send again.",
         )
         return
 
     cwd = Path(session.cwd or Path.home())
     stance = handle.stance or "ask"
-    kit_tools, system_extra = await kit_payload(session, brain)
+    if forge_command:
+        stance = PLAN_STANCE if stance == "read-only" else stance
+        kit_tools, system_extra = {}, ""
+    else:
+        kit_tools, system_extra = await kit_payload(session, brain)
     if tool_choices:
         from jarvis.agent_chat.tool_catalog import (
             live_catalog,
@@ -477,7 +487,11 @@ async def run_brain_turn(
         kit_tools=kit_tools,
         system_extra=system_extra,
     )
-    _note_skill_trigger(brain, text)
+    override = replace(
+        override, tool_context={**override.tool_context, "forge_interactive": forge_command}
+    )
+    if not forge_command:
+        _note_skill_trigger(brain, text)
 
     if bridge is not None:
         from jarvis.society.surface import requires_explicit_approval
@@ -590,7 +604,11 @@ async def _generate(
     }
     if output_language:
         kwargs["force_output_language"] = output_language
-    secret = _agent_secret(get_jarvis_agent_secret, session.provider)
+    secret = (
+        None
+        if override.tool_context.get("forge_interactive")
+        else _agent_secret(get_jarvis_agent_secret, session.provider)
+    )
     overrides = {session.provider: secret} if secret else {}
     # The task inherits the credential override through its context copy, so
     # the scoped brain instance resolves the Agents-tab key on first use.

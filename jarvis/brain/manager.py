@@ -10898,20 +10898,27 @@ class BrainManager:
         skill_state = _SkillTurnState(self)
         skill_token = _SKILL_TURN_STATE.set(skill_state)
         try:
-            if user_text.lstrip().lower().startswith("forge "):
+            if user_text.lstrip()[:5].lower() == "forge":
                 from jarvis.forge.tool import NAMESPACE, command, render_result
 
                 if NAMESPACE.match(user_text.lstrip()):
                     tid = trace_id or uuid4()
                     forge = self._tools.get("forge_mind")
                     tool_context = dict(turn_override.tool_context) if turn_override else {}
-                    tool_context["forge_interactive"] = (
-                        source_layer == "ui.chat.typed" or consume_pending_voice_attachments
+                    tool_context.setdefault(
+                        "forge_interactive",
+                        source_layer == "ui.chat.typed" or consume_pending_voice_attachments,
                     )
                     if command(user_text) is None:
-                        reply = "FORGE command unsupported. Say or type forge list to inspect skills."
+                        reply = (
+                            "FORGE command unsupported. Say or type forge list to inspect skills."
+                        )
                     elif forge is None or self._tool_executor is None:
-                        reply = "FORGE is disabled."
+                        reply = (
+                            "FORGE is unavailable because its tool could not be initialized."
+                            if self._config.forge.enabled
+                            else "FORGE is disabled. Enable it in Jarvis configuration."
+                        )
                     elif (
                         turn_override
                         and turn_override.tool_filter

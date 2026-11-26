@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render as rtlRender, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -234,6 +234,48 @@ describe("ChatStage (agent chat)", () => {
     expect(screen.getByRole("textbox").textContent).toBe("forge learn jobs engineer remote");
     expect(useAgentChatStore.getState().timeline.items).toEqual([]);
     expect((command as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("posts the FORGE quick command through the OpenAI Codex chat composer", async () => {
+    const draft = useAgentChatStore.getState().draft;
+    useAgentChatStore.setState({
+      activeSessionId: "codex-chat",
+      catalog: {
+        ...CATALOG,
+        providers: CATALOG.providers.map((row) => row.id === "openai-codex" ? {
+          ...row,
+          cli_installed: true,
+          permission_modes: [
+            { id: "ask", label: "Ask", description: "" },
+            { id: "plan", label: "Plan", description: "" },
+          ],
+          default_permission_mode: "ask",
+        } : row),
+      },
+      draft: { ...draft, provider: "openai-codex", permissionMode: "ask", buildMode: "ask" },
+    });
+    const fetch = vi.fn(async (_url: string, _init?: RequestInit) =>
+      Response.json({ turn_id: "forge-turn" }),
+    );
+    vi.stubGlobal("fetch", fetch);
+    render(<ChatStage />);
+    expect(screen.getByTestId("composer-model").getAttribute("data-value")).toBe("openai-codex\u0001");
+    expect(screen.getByTestId("composer-plan").getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(screen.getByText("FORGE learning"));
+    fireEvent.click(screen.getByRole("button", { name: "forge learn jobs engineer remote" }));
+    const messages = () => fetch.mock.calls.filter(([url]) => url.endsWith("/messages"));
+    expect(messages()).toEqual([]);
+    const send = screen.getByTestId<HTMLButtonElement>("composer-send");
+    expect(send.disabled).toBe(false);
+    fireEvent.click(send);
+    await waitFor(() => expect(messages()).toHaveLength(1));
+    const [[url, init]] = messages();
+    expect(url).toBe("/api/agent-chat/sessions/codex-chat/messages");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(String(init?.body))).toMatchObject({
+      text: "forge learn jobs engineer remote",
+      attachments: [],
+    });
   });
 
   it("restores an unsent multiline draft after leaving the chat section", () => {
