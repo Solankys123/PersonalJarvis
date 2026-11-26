@@ -287,6 +287,22 @@ class RemoteScreenSession(ScreenSession):
         verdict = envelope.get("focused")
         return verdict if isinstance(verdict, bool) else None
 
+    def forge_observation(self) -> dict:
+        try:
+            envelope, _ = self._transport.call("forge_observe", timeout_s=_TIMEOUT_FAST_S)
+        except TransportError:
+            logger.debug("FORGE guest observation unavailable")
+            return {}
+        return envelope
+
+    def forge_action(self, params: dict[str, Any]) -> str:
+        try:
+            envelope, _ = self._transport.call("forge_act", params, timeout_s=_TIMEOUT_ACT_S)
+        except TransportError:
+            logger.debug("FORGE guest action receipt unavailable")
+            return "unknown"
+        return str(envelope.get("status", ""))
+
     # -- actuation ---------------------------------------------------------
 
     def act(self, action: str, params: dict[str, Any]) -> ActOutcome:

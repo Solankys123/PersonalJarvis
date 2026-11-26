@@ -440,8 +440,90 @@ if ($config.PSObject.Properties.Name -contains 'forge_fixture' -and $config.forg
     $forgeText.Dock = [System.Windows.Forms.DockStyle]::Top
     $forgeText.ReadOnly = $true
     $forgeForm.Controls.Add($forgeText)
+    $forgeWorkflowText = New-Object System.Windows.Forms.TextBox
+    $forgeWorkflowText.Dock = [System.Windows.Forms.DockStyle]::Top
+    $forgeWorkflowText.ReadOnly = $true
+    $forgeForm.Controls.Add($forgeWorkflowText)
+    $forgeStatus = New-Object System.Windows.Forms.Label
+    $forgeStatus.Dock = [System.Windows.Forms.DockStyle]::Top
+    $forgeStatus.Text = 'locked'
+    $forgeForm.Controls.Add($forgeStatus)
+    $forgeRevision = @{ Value = 0 }
+    $forgeControls = [ordered]@{
+        unlock_a = 'Unlock A'
+        unlock_b = 'Unlock B'
+        enter_marker = 'Enter marker'
+        submit = 'Submit'
+    }
+    foreach ($id in @($forgeControls.Keys)) {
+        $button = New-Object System.Windows.Forms.Button
+        $button.Text = $forgeControls[$id]
+        $button.Dock = [System.Windows.Forms.DockStyle]::Top
+        $button.Enabled = $id -cin @('unlock_a', 'unlock_b')
+        $forgeForm.Controls.Add($button)
+        $forgeControls[$id] = $button
+    }
     $forgeForm.Show()
     $forgeForm.Activate()
+}
+
+function Read-ForgeWorkflow {
+    $marker = switch -CaseSensitive ($forgeWorkflowText.Text) {
+        'FORGE ALPHA' { 'alpha' }
+        'FORGE BETA' { 'beta' }
+        '' { $null }
+        default { 'invalid' }
+    }
+    return @{
+        ok = $true
+        marker = $marker
+        phase = $forgeStatus.Text
+        revision = $forgeRevision.Value
+        controls = @($forgeControls.Keys | Where-Object { $forgeControls[$_].Enabled })
+    }
+}
+
+function Invoke-ForgeWorkflowAction {
+    param($Params)
+    $action = [string]$Params.action
+    if ([string]$Params.handle -cne $forgeForm.Handle.ToInt64().ToString() -or
+            [string]$Params.revision -cne [string]$forgeRevision.Value) {
+        return @{ ok = $true; status = 'stale' }
+    }
+    if ($action -cnotin @($forgeControls.Keys) -or
+            -not $forgeControls[$action].Enabled -or
+            [string]$Params.marker -cnotin @('alpha', 'beta')) {
+        return @{ ok = $true; status = 'rejected' }
+    }
+    $next = @()
+    $markerText = if ($Params.marker -ceq 'alpha') { 'FORGE ALPHA' } else { 'FORGE BETA' }
+    switch -CaseSensitive ($action) {
+        'unlock_a' { return @{ ok = $true; status = 'rejected' } }
+        'unlock_b' {
+            if ($forgeStatus.Text -cne 'locked' -or $forgeWorkflowText.Text -cne '') {
+                return @{ ok = $true; status = 'stale' }
+            }
+            $forgeStatus.Text = 'ready'
+            $next = @('enter_marker')
+        }
+        'enter_marker' {
+            if ($forgeStatus.Text -cne 'ready' -or $forgeWorkflowText.Text -cne '') {
+                return @{ ok = $true; status = 'stale' }
+            }
+            $forgeWorkflowText.Text = $markerText
+            $forgeStatus.Text = 'filled'
+            $next = @('submit')
+        }
+        'submit' {
+            if ($forgeStatus.Text -cne 'filled' -or $forgeWorkflowText.Text -cne $markerText) {
+                return @{ ok = $true; status = 'stale' }
+            }
+            $forgeStatus.Text = 'submitted'
+        }
+    }
+    foreach ($id in $forgeControls.Keys) { $forgeControls[$id].Enabled = $id -cin $next }
+    $forgeRevision.Value = $forgeRevision.Value + 1
+    return @{ ok = $true; status = 'accepted' }
 }
 
 function Invoke-ForgeRequest {
@@ -459,6 +541,14 @@ function Invoke-ForgeRequest {
         'typed_text_landed' {
             if (-not $available) { return @{ ok = $true; landed = $null } }
             return @{ ok = $true; landed = ($forgeText.Text -ceq [string]$Params.text) }
+        }
+        'forge_observe' {
+            if (-not $available) { return @{ ok = $false; error = 'fixture unavailable' } }
+            return (Read-ForgeWorkflow)
+        }
+        'forge_act' {
+            if (-not $available) { return @{ ok = $true; status = 'stale' } }
+            return (Invoke-ForgeWorkflowAction -Params $Params)
         }
         'act' {
             if (-not $available -or $Params.action -cne 'type_text' -or

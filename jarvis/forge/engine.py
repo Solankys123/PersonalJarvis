@@ -7,7 +7,10 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from .workflow import Observation
 
 FIXTURE = "forge-text-v1"
 MARKERS = {"alpha": "FORGE ALPHA", "beta": "FORGE BETA"}
@@ -49,8 +52,8 @@ class Evidence:
     target_id: str
     action: str
     marker: str
-    before: State
-    after: State
+    before: State | Observation
+    after: State | Observation | None
     verdict: Verdict
     reason: str
     attempt: int
@@ -87,9 +90,14 @@ class Lease:
 class Limits:
     attempts: int = 2
     seconds: float = 25
+    actions: int = 8
 
     def __post_init__(self) -> None:
-        if not 1 <= self.attempts <= 3 or not 1 <= self.seconds <= 60:
+        if (
+            not 1 <= self.attempts <= 3
+            or not 1 <= self.seconds <= 60
+            or not 1 <= self.actions <= 12
+        ):
             raise ValueError("invalid experiment limits")
 
 

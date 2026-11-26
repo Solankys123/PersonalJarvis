@@ -1,9 +1,11 @@
 # FORGE MIND fixture workflow
 
-FORGE MIND can learn, independently validate, promote, and replay one
-parameterized procedure in a disposable Windows Sandbox. The supported task
-sets the text field in the bundled fixture to one of two public markers.
-The guest reports the field value independently of the action receipt.
+FORGE MIND can learn, independently validate, promote, and replay
+parameterized procedures in a disposable Windows Sandbox. The supported task
+uses one of two public markers. The original text-entry task remains
+available, and the workflow variant discovers an unlock control, fills the
+workflow field, and submits it. The guest reports the field and workflow
+state independently of the action receipt.
 
 ## Setup and commands
 
@@ -23,6 +25,7 @@ enabled = true
 memory_mb = 2048
 attempts = 2
 run_seconds = 25
+action_budget = 8
 ```
 
 Use these exact commands in front-page Jarvis chat or classic speech.
@@ -35,6 +38,21 @@ Use the version returned by the learning command in later commands.
 5. `forge replay 1 alpha` runs the promoted version in a fresh guest.
 6. `forge stop` or the existing Emergency Stop requests cancellation. A guest
    operation already in progress may finish before teardown.
+
+For the multi-step task, start with `forge learn workflow alpha`, then use
+the same inspection, validation, promotion, and replay commands with its
+returned version. Validate with `beta`. The learner considers only approved
+controls exposed by the guest. It records unchanged rejections and skips
+equivalent rejections for the same marker from the 50 most recent learning
+runs. A fresh guest starts at revision zero. Each successful step advances
+exactly one revision and requires independent readback. A stale revision,
+unknown receipt, or unexpected result ends the run.
+
+The workflow uses at most eight action requests and two rejected attempts
+by default. Both limits are configurable under `[forge]`. Procedure schema
+2 stores typed steps and a parameterized goal in the existing SQLite tables.
+Schema 1 procedures remain executable with the original commands. Keep a
+copy of the database when testing a rollback to an older build.
 
 The action deadline applies after guest acquisition. Windows Sandbox startup
 and teardown are bounded separately by its provider and can take longer.
@@ -58,7 +76,10 @@ The guest disables networking, clipboard redirection, and vGPU. The mapped
 runner is read-only, the mailbox is scoped to the session, and the persistent
 browser profile is excluded. The restricted runner accepts only identity,
 health, fixture readback, fixed marker entry into the blank field, and
-teardown. It never invokes the general guest action dispatcher. All actions
+teardown. The dedicated workflow RPC additionally exposes fixed control
+identifiers and checks the window handle and expected revision before each
+state change. The restricted runner never invokes the general guest action
+dispatcher. All actions
 pass through the existing ToolExecutor and a scoped screen lease. Logs and
 SQLite evidence use only public marker identifiers and bounded state labels.
 There are no screenshots, arbitrary command strings, or credential inputs.
@@ -90,7 +111,7 @@ and profile settings. Linux tests use a fake screen and cannot qualify the host.
   clipboard redirection, and vGPU. Verify it maps only the read-only runner
   and the writable session mailbox. Keep a benign host window open and
   confirm its text stays untouched through the run.
-- **Lifecycle.** Run the command sequence above. Confirm a new draft cannot
+- **Lifecycle.** Run the original and multi-step command sequences above. Confirm a new draft cannot
   replay, same-marker validation fails, a different marker in a fresh guest
   validates, promotion requires the explicit command, and replay succeeds.
 - **Cancellation and cleanup.** Issue Emergency Stop during boot and close

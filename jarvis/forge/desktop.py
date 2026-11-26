@@ -12,10 +12,38 @@ from jarvis.agent_screen.port import RemoteScreenPort
 from jarvis.agent_screen.protocol import AgentScreenUnavailable
 from jarvis.agent_screen.providers.windows_sandbox import WindowsSandboxProvider
 from jarvis.agent_screen.tools import screen_bound_tools
+from jarvis.core.protocols import ToolResult
 
 from .engine import FIXTURE, MARKERS, Refused, State
+from .workflow import Action, ActionOutcome, Marker, Observation
 
 logger = logging.getLogger(__name__)
+
+
+class FixtureWorkflowAction:
+    """Executor-facing capability for the dedicated guest-only RPC."""
+
+    risk_tier = "monitor"
+    schema: dict[str, Any] = {}
+    description = "Apply an approved action to the isolated FORGE fixture."
+
+    def __init__(self, session: Any, action: Action) -> None:
+        self._session = session
+        self._action = action
+        self.name = f"forge_fixture_{action.value}"
+
+    async def execute(self, args: dict, ctx: Any) -> ToolResult:
+        if not self._session.isolated or self._session.kind != "windows-sandbox":
+            raise Refused("target_policy_denied")
+        params = {
+            "action": self._action.value,
+            "marker": Marker(args["marker"]).value,
+            "revision": args["revision"],
+            "handle": args["handle"],
+        }
+        status = await asyncio.to_thread(self._session.forge_action, params)
+        outcome = next((value for value in ActionOutcome if value == status), ActionOutcome.UNKNOWN)
+        return ToolResult(True, outcome)
 
 
 class WindowsFixture:
@@ -60,6 +88,31 @@ class WindowsFixture:
             cancel_token=token,
         )
         return result.success
+
+    async def observe_workflow(self) -> Observation:
+        if not self.isolated:
+            raise Refused("target_policy_denied")
+        return Observation.read(await asyncio.to_thread(self._session.forge_observation))
+
+    async def apply_workflow(
+        self,
+        action: Action,
+        marker: Marker,
+        revision: int,
+        fingerprint: tuple[Any, ...],
+        token: Any,
+    ) -> ActionOutcome:
+        if not self.isolated or await self.fingerprint() != fingerprint:
+            raise Refused("target_policy_denied")
+        tool = FixtureWorkflowAction(self._session, Action(action))
+        result = await self._executor.execute(
+            tool,
+            {"marker": marker.value, "revision": revision, "handle": str(fingerprint[1])},
+            trace_id=self._context.trace_id,
+            config_snapshot=self._context.config,
+            cancel_token=token,
+        )
+        return result.output if result.success else ActionOutcome.UNKNOWN
 
 
 async def _finish_owned_task(task: asyncio.Task) -> None:

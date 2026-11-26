@@ -2900,6 +2900,7 @@ class ForgeConfig(BaseModel):
     memory_mb: int = Field(default=2048, ge=1536, le=3072)
     attempts: int = Field(default=2, ge=1, le=3)
     run_seconds: float = Field(default=25, ge=1, le=60)
+    action_budget: int = Field(default=8, ge=1, le=12)
 
 
 class LocalActionConfig(BaseModel):

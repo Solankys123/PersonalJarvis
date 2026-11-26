@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .engine import Evidence, Procedure, Refused, State, Verdict
+from .workflow import Action, Marker, Phase, WorkflowProcedure
 
 SCHEMA = """
 BEGIN IMMEDIATE;
@@ -55,7 +56,7 @@ class Store:
                 )
             ]
 
-    def get(self, version: int) -> tuple[Procedure, str]:
+    def get(self, version: int) -> tuple[Procedure | WorkflowProcedure, str]:
         with self.connection() as db:
             row = db.execute(
                 "SELECT spec, state FROM procedures WHERE version=?",
@@ -63,8 +64,16 @@ class Store:
             ).fetchone()
         if row is None:
             raise Refused("unknown_version")
-        procedure = Procedure(**json.loads(row[0]))
-        procedure.validate()
+        try:
+            raw = json.loads(row[0])
+            if not isinstance(raw, dict):
+                raise ValueError("invalid procedure")
+            procedure = (
+                WorkflowProcedure.read(raw) if raw.get("schema_version") == 2 else Procedure(**raw)
+            )
+            procedure.validate()
+        except (ValueError, TypeError):
+            raise Refused("unsupported_procedure") from None
         return procedure, row[1]
 
     def receipt(self, run_id: str) -> tuple[int | None, str] | None:
@@ -117,8 +126,27 @@ class Store:
                 return None
             return self._receipt(db, run_id)
 
+    def rejected_actions(self, marker: Marker) -> frozenset[tuple[Phase, Action]]:
+        """Reuse only unchanged-state rejections from recent fixture explorations."""
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT evidence FROM runs WHERE mode='learn' ORDER BY rowid DESC LIMIT 50"
+            ).fetchall()
+        return frozenset(
+            (Phase(step["before"]["phase"]), Action(step["action"]))
+            for (raw,) in rows
+            for step in json.loads(raw)
+            if step["reason"] == "rejected_unchanged" and step["marker"] == marker
+        )
+
     def record(
-        self, run_id: str, mode: str, version: int | None, outcome: str, evidence: list[Evidence]
+        self,
+        run_id: str,
+        mode: str,
+        version: int | None,
+        outcome: str,
+        evidence: list[Evidence],
+        procedure: WorkflowProcedure | None = None,
     ) -> tuple[int | None, str]:
         final = evidence[-1] if evidence else None
         verified = (
@@ -130,11 +158,15 @@ class Store:
             and final.reason == "verified"
             and bool(final.target_id)
         )
+        if outcome == Verdict.SUCCESS and procedure is not None:
+            verified = procedure.verifies(evidence)
+            if not verified:
+                outcome = "goal_not_verified"
         with self.connection() as db:
             if mode == "learn" and verified:
                 row = db.execute(
                     "INSERT INTO procedures(spec,state) VALUES (?, 'draft')",
-                    (json.dumps(asdict(Procedure())),),
+                    (json.dumps(asdict(procedure if procedure is not None else Procedure())),),
                 )
                 version = row.lastrowid
             if mode == "validate" and verified:
