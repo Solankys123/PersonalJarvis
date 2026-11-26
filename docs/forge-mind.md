@@ -63,6 +63,22 @@ pass through the existing ToolExecutor and a scoped screen lease. Logs and
 SQLite evidence use only public marker identifiers and bounded state labels.
 There are no screenshots, arbitrary command strings, or credential inputs.
 
+## Automated acceptance
+
+Run from the repository root with the existing test dependencies installed.
+
+```sh
+python -m pytest -q -p no:cacheprovider tests/forge
+python -m pytest -q -p no:cacheprovider tests/unit/brain/test_routing.py -k forge
+python scripts/ci/check_silent_exception_handlers.py
+```
+
+The fake-guest suite exercises learning, independent validation, explicit
+promotion, replay, cancellation and late-guest cleanup, SQLite reload and
+duplicate delivery, and rejection of host or networked targets. The routing
+tests cover the chat, classic speech, and realtime tool entry points. These
+checks run without launching Windows Sandbox or contacting a model provider.
+
 ## Windows verification and rollback
 
 Run this checklist on the Windows 11 i3/8 GB acceptance machine using
