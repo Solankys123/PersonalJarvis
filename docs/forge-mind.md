@@ -1,5 +1,41 @@
 # FORGE MIND fixture workflow
 
+## Local browser skill
+
+The source checkout includes a synthetic job-search website. Enable FORGE
+in the existing config editor and install Jarvis's managed browser. The
+fixture uses a fresh sandboxed Chromium process, an offline context, and a
+single intercepted GET route. It can run without Windows Sandbox. Missing
+browser setup or process containment causes the command to stop.
+
+Use the front-page chat composer or say these commands. Replace `1` with
+the version returned when learning.
+
+1. `forge learn jobs engineer remote` records a verified draft.
+2. `forge list` and `forge inspect 1` show the saved procedure and recent failures.
+3. `forge validate 1 designer onsite` tests different parameters in a fresh browser.
+4. `forge promote 1` approves the validated draft.
+5. `forge replay 1 engineer onsite` replays it and checks the rendered result IDs.
+6. `forge stop` cancels an active run.
+
+The accepted roles are `engineer` and `designer`. Locations are `remote`
+and `onsite`. Only these fixture enums, the typed procedure, outcome codes,
+and run identifiers are stored in the existing FORGE SQLite database. Browser
+procedures use specification version 4 with the existing database schema.
+The browser workflow is limited to this fixture. Its worker requires a
+source installation.
+
+If a new fixture revision causes interface drift, use
+`forge improve 1 engineer remote` to record a linked draft. Independently
+validate and promote that version before replaying. The existing rollback
+command restores its predecessor.
+
+Set `FORGE_BROWSER_ACCEPTANCE=1` when running `tests/forge` with Playwright
+and its matching Chromium installed to exercise actual form submission,
+rendered result verification, drift, and improvement.
+
+## Windows desktop fixtures
+
 FORGE MIND can learn, independently validate, promote, and replay
 parameterized procedures in a disposable Windows Sandbox. The supported task
 uses one of two public markers. The original text-entry task remains

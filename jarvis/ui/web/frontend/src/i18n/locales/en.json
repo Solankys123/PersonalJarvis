@@ -709,6 +709,8 @@
     "chat_empty_title": "How can I help?",
     "composer_hint": "Enter to send · Shift+Enter for a new line",
     "model_hint": "Model in use — click to change it",
+    "forge_learning": "FORGE learning",
+    "forge_learning_help": "When FORGE is enabled, learn a read-only job search on the local fixture. Validate the saved version with a different role or location before promoting it.",
     "prompt_mode_pill": "Prompt",
     "prompt_mode_on": "Prompt Mode is on — every dictation comes out as a written-out prompt for an AI model, in the language you spoke. Click to switch it off.",
     "prompt_mode_off": "Prompt Mode is off — dictations arrive as spoken. Click to turn every dictation into a finished prompt for a coding agent.",

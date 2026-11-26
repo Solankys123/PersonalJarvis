@@ -242,6 +242,26 @@ export function ChatInput() {
           <ArrowUp className="h-4 w-4" />
         </button>
       </div>
+      <details className="px-1 text-meta text-muted-foreground">
+        <summary className="cursor-pointer">{t("home.forge_learning")}</summary>
+        <p className="my-2">{t("home.forge_learning_help")}</p>
+        <div className="flex flex-wrap gap-2">
+          {["forge list", "forge learn jobs engineer remote", "forge stop"].map((command) => (
+            <button
+              key={command}
+              type="button"
+              disabled={!connected}
+              className="rounded-md border border-border px-2 py-1 font-mono hover:bg-secondary disabled:opacity-50"
+              onClick={() => {
+                setValue(command);
+                textareaRef.current?.focus();
+              }}
+            >
+              {command}
+            </button>
+          ))}
+        </div>
+      </details>
     </div>
   );
 }

@@ -12,6 +12,7 @@ from typing import Any
 from jarvis.control.cancel import CancelScope, CancelToken, get_kill_switch
 from jarvis.core.protocols import ExecutionContext, ToolResult
 
+from .browser import EXPECTED, BrowserProcedure, Search, run_browser
 from .engine import Evidence, Limits, Procedure, Refused, Verdict, execute
 from .store import Store
 from .workflow import Goal, Marker, WorkflowProcedure, run_workflow
@@ -22,10 +23,12 @@ NAMESPACE = re.compile(
     r"^forge\s+(?:learn|list|inspect|validate|promote|replay|stop|improve|rollback)\b",
     re.ASCII | re.IGNORECASE,
 )
+JOB_PARAMETERS = r"(?:engineer|designer) (?:remote|onsite)"
 COMMAND = re.compile(
     r"forge (?:list|stop|learn (?:(?:workflow|receipt) )?(?:alpha|beta)"
+    rf"|learn jobs {JOB_PARAMETERS}"
     r"|(?:inspect|promote|rollback) [1-9][0-9]{0,8}"
-    r"|(?:validate|replay|improve) [1-9][0-9]{0,8} (?:alpha|beta))[.!]?",
+    rf"|(?:validate|replay|improve) [1-9][0-9]{{0,8}} (?:alpha|beta|{JOB_PARAMETERS}))[.!]?",
     re.ASCII | re.IGNORECASE,
 )
 
@@ -38,6 +41,8 @@ def command(text: str) -> tuple[str, ...] | None:
 
 
 def render_result(result: ToolResult) -> str:
+    if result.error == "procedure_already_saved":
+        return f"FORGE procedure {result.output['version']} already contains these steps."
     if not result.success:
         return f"FORGE stopped ({result.error})."
     if isinstance(result.output, str):
@@ -52,10 +57,19 @@ def render_result(result: ToolResult) -> str:
     reply = f"FORGE procedure {version} is {state}."
     if "procedure" in result.output:
         spec = result.output["procedure"]
+        if spec.get("schema_version") == 4:
+            failures = result.output["recent_failures"]
+            recent = f" Recent failures: {', '.join(failures)}." if failures else ""
+            return (
+                reply + f" It searches fixture revision {spec['fixture_version']} by job role "
+                "and work location, then verifies the displayed results." + recent
+            )
         if spec.get("schema_version") in (2, 3):
             actions = ", ".join(step["action"].replace("_", " ") for step in spec["steps"])
             return reply + f" Verified workflow steps are {actions}."
         return reply + " It sets the blank fixture field and reads back the exact marker."
+    if "jobs" in result.output:
+        return reply + f" Verified fixture results are {', '.join(result.output['jobs'])}."
     return reply + " Verification succeeded."
 
 
@@ -66,6 +80,8 @@ class ForgeMindTool:
         "Run the exact spoken or typed FORGE command. Commands: forge list, forge stop, "
         "forge learn alpha, forge inspect VERSION, forge validate VERSION beta, "
         "forge promote VERSION, forge replay VERSION alpha, forge learn workflow alpha. "
+        "For the local job fixture use forge learn jobs engineer remote, or give a "
+        "role and location after a version when validating, replaying, or improving. "
         "Use forge improve VERSION alpha to explore a new draft, or forge rollback VERSION "
         "to restore the previous validated version. The user utterance supplies the command."
     )
@@ -126,6 +142,11 @@ class ForgeMindTool:
                 procedure, state = await asyncio.to_thread(self._store.get, version)
             if mode == "inspect":
                 assert version is not None
+                details = {}
+                if isinstance(procedure, BrowserProcedure):
+                    details["recent_failures"] = await asyncio.to_thread(
+                        self._store.browser_failures, version
+                    )
                 return ToolResult(
                     True,
                     {
@@ -133,6 +154,7 @@ class ForgeMindTool:
                         "state": state,
                         "procedure": asdict(procedure),
                         "parent_version": await asyncio.to_thread(self._store.parent, version),
+                        **details,
                     },
                 )
             if mode == "promote":
@@ -145,6 +167,13 @@ class ForgeMindTool:
                 assert version is not None
                 restored = await asyncio.to_thread(self._store.rollback, version, authorized=True)
                 return ToolResult(True, f"FORGE procedure {restored} restored.")
+            if isinstance(procedure, BrowserProcedure) or (mode == "learn" and params[0] == "jobs"):
+                if len(params) != 3:
+                    raise Refused("job_search_parameters_required")
+                search = Search.read(*params[1:])
+                return await self._run_browser(mode, version, procedure, state, search, ctx)
+            if len(params) == 3:
+                raise Refused("marker_required")
             explore = None
             if mode == "learn" and params[0] == "workflow":
                 explore = Goal.SUBMIT_MARKER
@@ -172,6 +201,75 @@ class ForgeMindTool:
         except Refused as exc:
             logger.debug("FORGE command refused; returning a controlled result")
             return ToolResult(False, None, str(exc))
+
+    async def _run_browser(
+        self,
+        mode: str,
+        version: int | None,
+        procedure: Procedure | WorkflowProcedure | BrowserProcedure,
+        state: str,
+        search: Search,
+        ctx: ExecutionContext,
+    ) -> ToolResult:
+        run_id = self._run_id(ctx, mode, version, f"jobs:{search.marker}")
+        receipt = await asyncio.to_thread(self._store.receipt, run_id)
+        if receipt is not None:
+            return await self._result(*receipt, search=search)
+        if mode in {"replay", "improve"} and state != "promoted":
+            raise Refused("promoted_version_required")
+        if mode == "validate" and state != "draft":
+            raise Refused("draft_required")
+        if self._limits.actions < 3:
+            raise Refused("action_budget_exceeded")
+        if self._active is not None:
+            raise Refused("experiment_already_active")
+
+        stored_mode = "learn" if mode == "improve" else mode
+        stored_version = None if mode == "improve" else version
+        parent = version if mode == "improve" else None
+        saved = procedure if mode in {"validate", "replay"} else None
+        assert saved is None or isinstance(saved, BrowserProcedure)
+        async with CancelScope(get_kill_switch(), holder="forge") as token:
+            self._active = token
+            try:
+                old = await asyncio.to_thread(
+                    self._store.claim, run_id, stored_mode, stored_version
+                )
+                if old is not None:
+                    return await self._result(*old, search=search)
+                trace: list[Evidence] = []
+                learned = None
+                outcome = "interrupted"
+                try:
+                    async with asyncio.timeout(self._limits.seconds):
+                        learned = await run_browser(search, token, trace, saved)
+                    outcome = (
+                        "no_procedure_change"
+                        if parent and learned == procedure
+                        else Verdict.SUCCESS
+                    )
+                except TimeoutError:
+                    logger.warning("FORGE browser run exceeded its deadline")
+                    outcome = "budget_exceeded"
+                except Refused as exc:
+                    logger.debug("FORGE browser run refused")
+                    outcome = str(exc)
+                finally:
+                    if token.is_cancelled():
+                        outcome = "cancelled"
+                    result = await asyncio.to_thread(
+                        self._store.record,
+                        run_id,
+                        stored_mode,
+                        stored_version,
+                        outcome,
+                        trace,
+                        learned,
+                        parent,
+                    )
+                return await self._result(*result, search=search)
+            finally:
+                self._active = None
 
     async def _run(
         self,
@@ -280,13 +378,14 @@ class ForgeMindTool:
             )
         return await self._result(version, outcome)
 
-    async def _result(self, version: int | None, outcome: str) -> ToolResult:
+    async def _result(
+        self, version: int | None, outcome: str, *, search: Search | None = None
+    ) -> ToolResult:
         state = None
         if version is not None:
             _, state = await asyncio.to_thread(self._store.get, version)
         success = outcome == Verdict.SUCCESS
-        return ToolResult(
-            success,
-            {"outcome": outcome, "version": version, "state": state},
-            None if success else outcome,
-        )
+        output: dict[str, Any] = {"outcome": outcome, "version": version, "state": state}
+        if success and search is not None:
+            output["jobs"] = EXPECTED[search.role, search.location].copy()
+        return ToolResult(success, output, None if success else outcome)

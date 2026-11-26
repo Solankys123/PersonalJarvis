@@ -8,6 +8,7 @@ from contextlib import closing, contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
+from .browser import BrowserProcedure, BrowserStep
 from .engine import Evidence, Procedure, Refused, State, Verdict
 from .workflow import Action, Marker, Observation, RejectionKey, WorkflowProcedure
 
@@ -68,7 +69,7 @@ class Store:
                 )
             ]
 
-    def get(self, version: int) -> tuple[Procedure | WorkflowProcedure, str]:
+    def get(self, version: int) -> tuple[Procedure | WorkflowProcedure | BrowserProcedure, str]:
         with self.connection() as db:
             row = db.execute(
                 "SELECT spec, state FROM procedures WHERE version=?",
@@ -80,13 +81,15 @@ class Store:
             raw = json.loads(row[0])
             if not isinstance(raw, dict):
                 raise ValueError("invalid procedure")
-            procedure = (
-                WorkflowProcedure.read(raw)
-                if raw.get("schema_version") in (2, 3)
-                else Procedure(**raw)
-            )
+            if type(raw.get("schema_version")) is int and raw["schema_version"] == 4:
+                raw["steps"] = tuple(map(BrowserStep, raw["steps"]))
+                procedure = BrowserProcedure(**raw)
+            elif raw.get("schema_version") in (2, 3):
+                procedure = WorkflowProcedure.read(raw)
+            else:
+                procedure = Procedure(**raw)
             procedure.validate()
-        except (ValueError, TypeError):
+        except (KeyError, ValueError, TypeError):
             raise Refused("unsupported_procedure") from None
         return procedure, row[1]
 
@@ -124,7 +127,7 @@ class Store:
     @staticmethod
     def _learning_evidence(db: sqlite3.Connection, version: int | None) -> dict | None:
         row = db.execute(
-            "SELECT evidence FROM runs WHERE version=? AND mode='learn'",
+            "SELECT evidence FROM runs WHERE version=? AND mode='learn' AND outcome='success'",
             (version,),
         ).fetchone()
         return json.loads(row[0])[-1] if row else None
@@ -171,6 +174,17 @@ class Store:
             ).fetchone()
             return row[0] if row else None
 
+    def browser_failures(self, version: int) -> list[str]:
+        with self.connection() as db:
+            return [
+                outcome
+                for (outcome,) in db.execute(
+                    "SELECT outcome FROM runs WHERE version=? AND mode IN ('validate', 'replay') "
+                    "AND outcome != 'success' ORDER BY rowid DESC LIMIT 5",
+                    (version,),
+                )
+            ]
+
     def record(
         self,
         run_id: str,
@@ -178,7 +192,7 @@ class Store:
         version: int | None,
         outcome: str,
         evidence: list[Evidence],
-        procedure: WorkflowProcedure | None = None,
+        procedure: WorkflowProcedure | BrowserProcedure | None = None,
         parent: int | None = None,
     ) -> tuple[int | None, str]:
         final = evidence[-1] if evidence else None
@@ -196,21 +210,35 @@ class Store:
             if not verified:
                 outcome = "goal_not_verified"
         with self.connection() as db:
-            if parent is not None and verified:
+            if isinstance(procedure, BrowserProcedure) and verified:
                 db.execute("BEGIN IMMEDIATE")
+            if parent is not None and verified:
+                if not db.in_transaction:
+                    db.execute("BEGIN IMMEDIATE")
                 row = db.execute(
                     "SELECT state FROM procedures WHERE version=?", (parent,)
                 ).fetchone()
                 if row != ("promoted",):
                     verified, outcome = False, "active_parent_required"
             if mode == "learn" and verified:
-                row = db.execute(
-                    "INSERT INTO procedures(spec,state) VALUES (?, 'draft')",
-                    (json.dumps(asdict(procedure if procedure is not None else Procedure())),),
-                )
-                version = row.lastrowid
-                if parent is not None:
-                    db.execute("INSERT INTO skill_lineage VALUES (?, ?)", (version, parent))
+                spec = json.dumps(asdict(procedure if procedure is not None else Procedure()))
+                duplicate = None
+                if isinstance(procedure, BrowserProcedure):
+                    duplicate = db.execute(
+                        "SELECT p.version FROM procedures p "
+                        "LEFT JOIN skill_lineage l USING (version) "
+                        "WHERE p.spec=? AND l.parent IS ? ORDER BY p.version LIMIT 1",
+                        (spec, parent),
+                    ).fetchone()
+                if duplicate:
+                    version, outcome = duplicate[0], "procedure_already_saved"
+                else:
+                    row = db.execute(
+                        "INSERT INTO procedures(spec,state) VALUES (?, 'draft')", (spec,)
+                    )
+                    version = row.lastrowid
+                    if parent is not None:
+                        db.execute("INSERT INTO skill_lineage VALUES (?, ?)", (version, parent))
             if mode == "validate" and verified:
                 original = self._learning_evidence(db, version)
                 changed = 0
