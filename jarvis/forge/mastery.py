@@ -161,7 +161,10 @@ def planning_prompt(
             '"evidence": "specific visible outcome"} instead of steps, check or browser_search. '
             'Use the currently open application/session. For browsing, limit the exercise to '
             'navigation, searching and reading. Keep private screen details and practice inputs '
-            'out of the durable guidance.\n\n'
+            'out of the durable guidance. In goal include only the concrete desktop actions. '
+            'Omit approval, activation, and other chat workflow instructions from goal and '
+            'evidence. Jarvis handles those separately. Describe evidence the desktop executor '
+            'can observe and report itself.\n\n'
             if "computer_use" in tools else ""
         )
         + "Available exercise tools:\n" + json.dumps(catalog, ensure_ascii=False)
@@ -177,7 +180,8 @@ def reuse_prompt(task: str, instructions: str, tools: Mapping[str, Tool]) -> str
         return (
             'Bind the verified live desktop method to the current request. Return JSON with '
             '"desktop": {"application": "same verified app and site", "goal": "scoped task", '
-            '"evidence": "specific visible outcome"}. Use only current user inputs. If the '
+            '"evidence": "specific visible outcome"}. Write the goal as a direct action to '
+            'perform now. Use only current user inputs. If the '
             'method does not apply or the inputs are missing, return {}.\n\n'
             "Verified method:\n" + instructions + "\n\nCurrent request:\n" + task
         )
@@ -239,15 +243,24 @@ class DesktopPractice:
         if "\n" in self.application or "\r" in self.application:
             raise ValueError("The desktop application must be a single line.")
 
-    def tool_args(self) -> dict[str, str]:
-        return {"goal": (
-            f"In the existing open {self.application} session, {self.goal}\n"
+    def tool_args(self, *, approved: bool = False) -> dict[str, str]:
+        goal = (
+            f"Use the existing open {self.application} session. {self.goal}\n"
             f"Verify on the current screen: {self.evidence}\n"
             "Use only that existing app or browser session. For website use, stay on the "
             "named site and only navigate, search, or read. Stop if access is denied or "
             "a login, consent, or CAPTCHA is required. Do not submit applications, change "
             "profiles or account settings, upload, send, purchase, or disclose private data."
-        )}
+        )
+        if approved:
+            goal = (
+                "Jarvis recorded approval for this exercise before dispatch. "
+                "Any practical approval mentioned below has already been granted in Agent Chat. "
+                "Proceed with the approved desktop actions. The approval card and skill activation "
+                "are handled by Jarvis outside this desktop run.\n"
+                + goal
+            )
+        return {"goal": goal}
 
     def matches_skill(self, instructions: str) -> bool:
         return f"Verified application: {self.application}" in instructions.splitlines()

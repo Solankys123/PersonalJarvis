@@ -679,7 +679,7 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
             raise mastery.MasteryError("The mastered skill changed during reuse.")
 
     async def run_desktop(practice: mastery.DesktopPractice, *, scoped: bool = False) -> None:
-        args = practice.tool_args()
+        args = practice.tool_args(approved=scoped)
 
         def guard() -> None:
             check_permission()
@@ -715,6 +715,13 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
                 pending.cancel()
                 await asyncio.gather(pending, return_exceptions=True)
         stdout = result.output.get("stdout") if isinstance(result.output, dict) else None
+        if not result.success:
+            stderr = result.output.get("stderr") if isinstance(result.output, dict) else None
+            detail = stderr.splitlines()[0] if isinstance(stderr, str) and stderr else result.error
+            if detail:
+                raise mastery.MasteryError(
+                    redact_secrets(f"Desktop exercise failed ({detail[:500]}).")
+                )
         if not result.success or not isinstance(stdout, str) or not _extract_cu_proof(stdout):
             raise mastery.MasteryError("The desktop agent did not verify the visible outcome.")
 

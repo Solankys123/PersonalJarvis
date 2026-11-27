@@ -277,8 +277,12 @@ async def test_adaptive_browser_mastery_and_reuse(mastery_chat, monkeypatch, ver
         assert model.calls == 3
 
 
-@pytest.mark.parametrize("proof", ["", "Matching jobs are visible for the search query."])
-async def test_signed_in_mastery_awaits_desktop_verifier(mastery_chat, monkeypatch, proof):
+@pytest.mark.parametrize(("proof", "stderr"), [
+    ("", ""),
+    ("", "[cu] fail at step-1: The approval card is not visible."),
+    ("Matching jobs are visible for the search query.", ""),
+])
+async def test_signed_in_mastery_awaits_desktop_verifier(mastery_chat, monkeypatch, proof, stderr):
     from jarvis.agent_chat.runner_brain import brain_manager
 
     service, cwd, registry = mastery_chat
@@ -289,7 +293,9 @@ async def test_signed_in_mastery_awaits_desktop_verifier(mastery_chat, monkeypat
             assert name == "screenshot"
             goals.append(task.prompt)
             stdout = f"[cu] done (verified: {proof})" if proof else "[cu] done"
-            yield HarnessResult(stdout=stdout, exit_code=0, is_final=True)
+            yield HarnessResult(
+                stdout=stdout, stderr=stderr, exit_code=5 if stderr else 0, is_final=True,
+            )
 
     class DesktopModel:
         calls = 0
@@ -344,12 +350,19 @@ async def test_signed_in_mastery_awaits_desktop_verifier(mastery_chat, monkeypat
     assert not goals
     assert service.resolve_approval(sid, card["approval_id"], "allow")
     await asyncio.wait_for(service.wait_turn(sid), timeout=5)
-    assert goals == [card["input"]["exercise"]["goal"]]
+    assert len(goals) == 1
+    assert goals[0].startswith("Jarvis recorded approval for this exercise before dispatch.")
+    assert goals[0].split("\n", 1)[1] == card["input"]["exercise"]["goal"]
     assert [
         row["payload"]["name"] for row in service.store.list_events(sid)
         if row["kind"] == "approval_required"
     ] == ["forge_mastery"]
     assert bool(registry.list_active()) == bool(proof)
+    if stderr:
+        assert any(
+            row["kind"] == "assistant_text" and stderr in row["payload"]["text"]
+            for row in service.store.list_events(sid)
+        )
     if proof:
         await service.send(sid, "Search Naukri jobs for design jobs")
         await asyncio.wait_for(service.wait_turn(sid), timeout=5)
