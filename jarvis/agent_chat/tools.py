@@ -295,6 +295,10 @@ def _write(args: dict[str, Any], cwd: Path) -> tuple[str, bool]:
     path = resolve_path(cwd, args.get("file_path"))
     content = str(args.get("content") or "")
     path.parent.mkdir(parents=True, exist_ok=True)
+    if args.get("create_only") is True:
+        with path.open("x", encoding="utf-8", newline="") as stream:
+            stream.write(content)
+        return f"Created {_display(path, cwd)} ({len(content)} chars)", False
     existed = path.exists()
     path.write_text(content, encoding="utf-8")
     verb = "Updated" if existed else "Created"

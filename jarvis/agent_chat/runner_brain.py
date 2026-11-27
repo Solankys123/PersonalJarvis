@@ -421,6 +421,8 @@ async def run_brain_turn(
     always_allowed: set[str],
     tool_choices: list[ToolChoice] | None = None,
     forge_command: bool = False,
+    mastery_command: bool = False,
+    mastered_reuse: bool = False,
 ) -> None:
     """Run one typed turn on Jarvis' brain, streaming it into the timeline."""
     started = time.monotonic()
@@ -513,7 +515,7 @@ async def run_brain_turn(
             ),
         },
     )
-    if not forge_command:
+    if not (forge_command or mastery_command or mastered_reuse):
         _note_skill_trigger(brain, text)
 
     if bridge is not None:
@@ -561,7 +563,22 @@ async def run_brain_turn(
     error: str | None = None
     reply = ""
     try:
-        reply = await _generate(brain, text, handle, override, feed)
+        if mastery_command or mastered_reuse:
+            from jarvis.forge.mastery import MasteryError
+
+            try:
+                task = asyncio.create_task(
+                    _master_skill(
+                        brain, text, handle, override, mirror, bridge, ref, reuse=mastered_reuse,
+                    ),
+                    name=f"agent-chat-mastery-{turn_id[:8]}",
+                )
+                reply = await _wait_for_turn_task(task, handle)
+            except MasteryError as exc:
+                reply = str(exc)
+                status, error = "error", "skill_mastery_unverified"
+        else:
+            reply = await _generate(brain, text, handle, override, feed)
     except asyncio.CancelledError:
         status = "cancelled"
     except Exception as exc:  # noqa: BLE001 — the timeline must never spin forever
@@ -574,7 +591,7 @@ async def run_brain_turn(
 
     if status == "done" and handle.cancel.is_set():
         status = "cancelled"
-    if status == "done":
+    if status == "done" or reply:
         answer = (reply or "").strip() or "".join(seen).strip()
         if answer:
             await emit(
@@ -586,6 +603,167 @@ async def run_brain_turn(
             status = "error"
             error = override.receipt.failure_reason or "guarded_response"
     await finish(status, override.receipt.usage(), error)
+
+
+async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, reuse=False) -> str:
+    from jarvis.agent_chat.browser_model import browser_model_for
+    from jarvis.agent_chat.folder_tools import FolderTool
+    from jarvis.core.config import get_jarvis_agent_secret, override_provider_secrets
+    from jarvis.core.redact import redact_secrets
+    from jarvis.forge import mastery
+    from jarvis.skills.skill_context import try_get_skill_context
+    from jarvis.society.browser.tool import lead_browser_tools
+
+    context = try_get_skill_context()
+    executor = getattr(brain, "_tool_executor", None)
+    if context is None or executor is None or bridge is None:
+        raise mastery.MasteryError("Skill mastery is unavailable while Jarvis is starting.")
+    stance = handle.stance or "ask"
+    if stance in ("plan", "read-only"):
+        raise mastery.MasteryError("Switch out of read-only mode to approve a practical exercise.")
+    task = text if reuse else mastery.request(text)
+    if not task:
+        task = next(
+            (message.content for message in reversed(brain_history_from_events(handle.history))
+             if message.role == "user" and isinstance(message.content, str)
+             and mastery.request(message.content) is None),
+            "",
+        )
+    task = redact_secrets(task)
+    if not task:
+        raise mastery.MasteryError(
+            "Describe the skill to master or complete a task in this chat first."
+        )
+    prior = mastery.mastery_match(task)
+    tools = mastery.exercise_tools(brain._apply_turn_override_tools(None, override))
+    if not reuse and "search_web" not in tools:
+        raise mastery.MasteryError("Current documentation search is unavailable in this chat.")
+    expires = time.monotonic() + APPROVAL_TIMEOUT_S
+
+    def check_permission() -> None:
+        mastery.check_cancel(handle.cancel)
+        if handle.control_service is not None:
+            current = handle.control_service.store.get_session(handle.session.session_id)
+            if current is None or current.permission_mode != handle.session.permission_mode:
+                raise mastery.MasteryError("The exercise authorization was revoked.")
+        if time.monotonic() >= expires:
+            raise mastery.MasteryError("The exercise authorization expired.")
+
+    for name, observer in lead_browser_tools(handle.session, read_only=True).items():
+        if name in tools:
+            tools[f"{name}_observe"] = observer
+
+    async def execute_call(call: mastery.Call, check: mastery.Call, rationale: str):
+        check_permission()
+        snapshot = dict(override.tool_context)
+        if call is check and not isinstance(tools[call.tool], FolderTool):
+            snapshot["chat_read_only"] = True
+        return await executor.execute(
+            tools[call.tool], dict(call.args), config_snapshot=snapshot,
+            trace_id=handle.trace_id, rationale=rationale,
+        )
+
+    check_permission()
+    secret = _agent_secret(get_jarvis_agent_secret, handle.session.provider)
+    with override_provider_secrets({handle.session.provider: secret} if secret else {}):
+        model = browser_model_for(brain._config, override.provider, override.model or "")
+        check_permission()
+        if reuse:
+            if prior is None:
+                raise mastery.MasteryError("The mastered skill is no longer active.")
+            instructions = context.runner.render_instructions(
+                prior, args={"utterance": task, "_trigger": "chat"},
+            )
+            reply = await mastery.complete(
+                model, mastery.reuse_prompt(task, instructions, tools), max_tokens=3000,
+            )
+            check_permission()
+            calls = mastery.parse_proposal(reply, tools, reuse=True)
+            if calls is None:
+                return instructions
+            await asyncio.to_thread(
+                mastery.bind_folder_scope, calls, tools, Path(override.tool_context["cwd"]),
+                reuse=True,
+            )
+
+            async def run_saved(call):
+                check_permission()
+                current_skill = mastery.mastery_match(task)
+                if current_skill is None or current_skill.body_hash != prior.body_hash:
+                    raise mastery.MasteryError("The mastered skill changed during reuse.")
+                return await execute_call(call, calls.check, "Apply verified skill " + prior.name)
+
+            await mastery.exercise(calls, run_saved, check_permission, reuse=True)
+            return f"Applied /{prior.name} to the current inputs and verified the result."
+        query = await mastery.research_topic(model, task)
+        check_permission()
+        research = await executor.execute(
+            tools["search_web"],
+            {"query": query, "queries": [" ".join(query.split()[:4])], "max_results": 5},
+            config_snapshot={**override.tool_context, "chat_read_only": True},
+            trace_id=handle.trace_id, rationale="Research public documentation for skill mastery",
+        )
+        references = mastery.search_references(research)
+        check_permission()
+        reply = await mastery.complete(
+            model, mastery.planning_prompt(task, tools, prior, references), max_tokens=4000,
+        )
+    check_permission()
+    proposal = mastery.parse_proposal(reply, tools)
+    assert isinstance(proposal, mastery.Proposal)
+    if not any(row["url"] in proposal.knowledge for row in references):
+        raise mastery.MasteryError("The proposed guidance did not cite the research results.")
+    if prior is None:
+        prior = next((s for s in context.registry.list_active() if
+                      s.name == proposal.name and mastery.is_mastered(s)), None)
+        if prior is None and any(s.name == proposal.name for s in context.registry.list()):
+            raise mastery.MasteryError("That skill name is already in use.")
+
+    await asyncio.to_thread(
+        mastery.bind_folder_scope, proposal, tools, Path(override.tool_context["cwd"]),
+    )
+
+    async with asyncio.timeout(max(0, expires - time.monotonic())):
+        decision = await handle.request_approval(
+            handle.turn_id, "forge_mastery",
+            {**proposal.approval_input(), **({"update_skill": prior.name} if prior else {})},
+            "Run the scoped exercise and save the displayed guidance if verification passes.",
+        )
+    check_permission()
+    if decision not in {"allow", "allow_always"}:
+        return "Skill mastery declined. The exercise did not run."
+
+    # Only the exact new-file operation can consume the scoped approval.
+    # Other confirmation gates, including plausibility, retain their cards.
+    active: mastery.Call | None = None
+
+    def scoped(name: str, args: dict[str, Any]) -> bool:
+        try:
+            check_permission()
+        except (mastery.MasteryError, asyncio.CancelledError):
+            return False
+        return (
+            active is not None and name == active.tool == "Write"
+            and isinstance(tools[name], FolderTool) and args == active.args
+            and args.get("create_only") is True and not handle.cancel.is_set()
+        )
+
+    bridge.arm(ref, ChatGrant(
+        handle.session.session_id, handle.turn_id, "always_ask", set(),
+        handle.request_approval, call_id_for=mirror.open_call_id, scoped_approval=scoped,
+    ))
+
+    async def execute(call: mastery.Call):
+        nonlocal active
+        active = call
+        try:
+            return await execute_call(call, proposal.check, "FORGE mastery exercise")
+        finally:
+            active = None
+
+    await mastery.exercise(proposal, execute, check_permission)
+    name = await mastery.save(proposal, context.registry, handle.bus, prior)
+    return f"Verified and activated /{name}. The skill is available for future matching tasks."
 
 
 async def _generate(
@@ -659,6 +837,10 @@ async def _generate(
         task: asyncio.Task[str] = asyncio.create_task(
             brain.generate(text, **kwargs), name=f"agent-chat-brain-{handle.turn_id[:8]}"
         )
+    return await _wait_for_turn_task(task, handle)
+
+
+async def _wait_for_turn_task(task: asyncio.Task[str], handle: TurnHandle) -> str:
     waiter = asyncio.create_task(handle.cancel.wait())
     try:
         done, _ = await asyncio.wait({task, waiter}, return_when=asyncio.FIRST_COMPLETED)
@@ -672,6 +854,8 @@ async def _generate(
         raise asyncio.CancelledError
     finally:
         waiter.cancel()
+        if not task.done():
+            task.cancel()
 
 
 def _agent_secret(resolver: Callable[[str], str | None], provider: str) -> str | None:

@@ -167,7 +167,10 @@ class BrowserTool:
         task = str(args.get("task") or "").strip()
         if not task:
             return None
-        return {"task": task[:300], "url": str(args.get("url") or "")[:200]}
+        detail = {"task": task[:300], "url": str(args.get("url") or "")[:200]}
+        if self._read_only and self._jobs._python is None:
+            detail["level"] = "read"
+        return detail
 
     async def execute(self, args: dict[str, Any], ctx: Any) -> ToolResult:
         from ..approvals import Verdict, decide

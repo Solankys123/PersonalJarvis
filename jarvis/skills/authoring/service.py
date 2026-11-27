@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import logging
 import re
+import tempfile
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +158,19 @@ def render_skill_md(req: SkillCreateRequest) -> str:
     return f"---\n{yaml_text}---\n\n{body.rstrip()}\n"
 
 
+def _replace_text(path: Path, text: str) -> None:
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=".skill-", delete=False,
+    ) as stream:
+        temp = Path(stream.name)
+        try:
+            stream.write(text)
+            stream.close()
+            temp.replace(path)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
 class SkillAuthoringService:
     """Creates a user skill on disk and refreshes the registry."""
 
@@ -241,6 +256,40 @@ class SkillAuthoringService:
 
         await self._emit_created(created, req.author)
         return created
+
+    async def append_verified_experience(self, skill: Skill, experience: str) -> None:
+        """Preserve the active instructions and archive the exact prior revision."""
+        from jarvis.skills.schema import SkillLifecycleState
+
+        current = parse_skill(skill.path)
+        if (
+            current.state != SkillLifecycleState.ACTIVE
+            or self._registry.get(skill.name).state != SkillLifecycleState.ACTIVE
+            or current.body_hash != skill.body_hash
+            or current.frontmatter != skill.frontmatter
+        ):
+            raise SkillAuthoringError("Skill changed while the exercise was running.", status=409)
+        previous = skill.path.read_text(encoding="utf-8")
+        version = current.frontmatter.version
+        major, minor, patch = map(int, version.split("."))
+        revised = re.sub(
+            r"(?m)^version: [^\n]+$", f"version: {major}.{minor}.{patch + 1}", previous, count=1,
+        )
+        if revised == previous:
+            raise SkillAuthoringError("Skill version could not be updated.")
+        history = skill.path.parent / "history"
+        history.mkdir(exist_ok=True)
+        archive = history / f"{version}.md"
+        if archive.exists() and archive.read_text(encoding="utf-8") != previous:
+            raise SkillAuthoringError(
+                "Skill history already contains a different revision.", status=409,
+            )
+        if not archive.exists():
+            _replace_text(archive, previous)
+        stamp = datetime.now(UTC).date().isoformat()
+        revised = revised.rstrip() + f"\n\n## Verified experience ({stamp})\n\n" + experience
+        _replace_text(skill.path, revised)
+        self._registry.reload_sync()
 
     async def _emit_created(self, skill: Skill, author: str) -> None:
         bus = self._bus

@@ -606,6 +606,8 @@ class AgentChatService:
         if session.surface == "society":
             session = await self.bind_society_session(session_id, routine_run=routine_run)
         forge_command = False
+        mastery_command = False
+        mastered_reuse = False
         if (
             session.surface == "jarvis"
             and direct_user
@@ -613,11 +615,20 @@ class AgentChatService:
             and not control_owned
             and control_runner is None
         ):
+            from jarvis.forge.mastery import mastery_match
+            from jarvis.forge.mastery import request as mastery_request
             from jarvis.forge.tool import NAMESPACE
 
             forge_command = NAMESPACE.match(text.lstrip()) is not None
+            mastery_command = mastery_request(text) is not None
+            mastered_reuse = (
+                not (forge_command or mastery_command or read_only)
+                and session.permission_mode not in ("plan", "read-only")
+                and supports_cli_runner(resolve_runner(session.provider, surface="jarvis"))
+                and mastery_match(text) is not None
+            )
         selected_runner = None
-        if session.surface == "jarvis" and not forge_command:
+        if session.surface == "jarvis" and not (forge_command or mastery_command):
             from jarvis.core.task_agent import subscription_seat_off_loop
 
             # The saved chat pick is authoritative. Global worker preferences
@@ -654,7 +665,7 @@ class AgentChatService:
         ):
             from .control import supports_restricted_turn
 
-            if not forge_command and not supports_restricted_turn(session):
+            if not (forge_command or mastery_command) and not supports_restricted_turn(session):
                 raise ValueError("This runner cannot enforce read-only mode; choose an API model")
         if incoming is not None:
             receipt = await self.receive_message(session_id, incoming)
@@ -757,7 +768,7 @@ class AgentChatService:
             )
         runner = (
             "brain"
-            if forge_command
+            if forge_command or mastery_command or mastered_reuse
             else selected_runner or resolve_runner(session.provider, surface=session.surface)
         )
         await self._emit(
@@ -844,9 +855,11 @@ class AgentChatService:
                     async with self._brain_lock:
                         await run_brain_turn(
                             run_handle,
-                            run_prompt,
+                            text if mastery_command else run_prompt,
                             bridge=self._bridge_for(bus),
                             always_allowed=self.always_allowed(session_id),
+                            **({"mastery_command": True} if mastery_command else {}),
+                            **({"mastered_reuse": True} if mastered_reuse else {}),
                             **({"tool_choices": selected} if selected else {}),
                         )
                 elif supports_cli_runner(runner):
@@ -1225,6 +1238,8 @@ class AgentChatService:
         finally:
             self._approvals.pop(approval_id, None)
             self._approval_session.pop(approval_id, None)
+        if name == "forge_mastery" and decision == "allow_always":
+            decision = "allow"
         await self._emit(
             session_id,
             make_event(

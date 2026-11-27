@@ -92,6 +92,7 @@ class ChatGrant:
     pre_approved: set[str] = field(default_factory=set)
     #: Society's explicit require-approval rules override Bypass.
     force_ask: Callable[[str, dict[str, Any]], bool] = field(default=lambda _name, _args: False)
+    scoped_approval: Callable[[str, dict[str, Any]], bool] | None = None
 
 
 class ChatApprovalBridge:
@@ -142,6 +143,12 @@ class ChatApprovalBridge:
                 return
             args = self._args.get(event.trace_id) or {}
             decision = self._decide_inline(grant, event.tool_name, args)
+            if grant.scoped_approval is not None:
+                decision = (
+                    "user"
+                    if event.reason == "risk_tier" and grant.scoped_approval(event.tool_name, args)
+                    else None
+                )
             if decision is not None:
                 self._args.pop(event.trace_id, None)
                 await self._bus.publish(
