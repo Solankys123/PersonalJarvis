@@ -8,12 +8,84 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 import sys
 import threading
 import time
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+
+def activate_owned_chrome(pid: int) -> tuple[bool, bool]:
+    """Show the temporary browser once and report the real desktop foreground."""
+    if os.name != "nt":
+        return False, False
+    import ctypes  # noqa: PLC0415
+    from ctypes import wintypes  # noqa: PLC0415
+
+    u = ctypes.WinDLL("user32", use_last_error=True)
+    callback = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    signatures = {
+        "EnumWindows": ([callback, wintypes.LPARAM], wintypes.BOOL),
+        "GetWindowThreadProcessId": (
+            [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)],
+            wintypes.DWORD,
+        ),
+        "GetClassNameW": ([wintypes.HWND, wintypes.LPWSTR, ctypes.c_int], ctypes.c_int),
+        "GetWindow": ([wintypes.HWND, wintypes.UINT], wintypes.HWND),
+        "IsWindowVisible": ([wintypes.HWND], wintypes.BOOL),
+        "IsIconic": ([wintypes.HWND], wintypes.BOOL),
+        "ShowWindowAsync": ([wintypes.HWND, ctypes.c_int], wintypes.BOOL),
+        "SetForegroundWindow": ([wintypes.HWND], wintypes.BOOL),
+        "MonitorFromWindow": ([wintypes.HWND, wintypes.DWORD], wintypes.HANDLE),
+        "GetForegroundWindow": ([], wintypes.HWND),
+    }
+    for name, (argtypes, restype) in signatures.items():
+        method = getattr(u, name)
+        method.argtypes = argtypes
+        method.restype = restype
+
+    def owned(hwnd: int) -> bool:
+        owner = wintypes.DWORD()
+        return bool(u.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))) and owner.value == pid
+
+    windows: list[int] = []
+
+    @callback
+    def visit(hwnd: int, _unused: int) -> bool:
+        if owned(hwnd) and u.IsWindowVisible(hwnd) and not u.GetWindow(hwnd, 4):  # GW_OWNER
+            name = ctypes.create_unicode_buffer(64)
+            u.GetClassNameW(hwnd, name, len(name))
+            if name.value == "Chrome_WidgetWin_1":
+                windows.append(hwnd)
+        return True
+
+    u.EnumWindows(visit, 0)
+    if len(windows) != 1 or not owned(windows[0]):
+        log.debug("FORGE foreground activation found %d owned Chrome windows", len(windows))
+        return False, False
+    hwnd = windows[0]
+    if u.IsIconic(hwnd):
+        u.ShowWindowAsync(hwnd, 9)  # SW_RESTORE
+    # Windows can reject foreground requests from background processes. Let its
+    # focus policy stand and let the user switch via the taskbar in that case.
+    requested = bool(u.SetForegroundWindow(hwnd))
+    visible = bool(
+        owned(hwnd)
+        and u.IsWindowVisible(hwnd)
+        and not u.IsIconic(hwnd)
+        and u.MonitorFromWindow(hwnd, 0)
+    )
+    foreground = u.GetForegroundWindow() == hwnd
+    if not (visible and foreground):
+        log.debug(
+            "FORGE foreground activation requested=%s visible_on_monitor=%s foreground=%s",
+            requested,
+            visible,
+            foreground,
+        )
+    return visible, foreground
 
 
 def available() -> bool:

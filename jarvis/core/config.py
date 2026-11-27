@@ -2894,12 +2894,24 @@ class ComputerUseConfig(BaseModel):
 
 
 class ForgeConfig(BaseModel):
-    """Opt-in, offline Windows fixture experiments."""
+    """Opt-in fixture experiments and managed public browser search."""
 
     enabled: bool = False
     memory_mb: int = Field(default=2048, ge=1536, le=3072)
     attempts: int = Field(default=2, ge=1, le=3)
-    run_seconds: float = Field(default=25, ge=1, le=60)
+    run_seconds: float = Field(
+        default=25, ge=1, le=60, description="Legacy run limit. Dynamic search uses web_run_seconds."
+    )
+    web_run_seconds: float = Field(
+        default=300, ge=30, le=540, description="Overall dynamic browser search deadline in seconds."
+    )
+    web_model_seconds: float = Field(
+        default=60, ge=1, le=180, description="Maximum seconds per browser model response."
+    )
+    web_approval_seconds: float = Field(
+        default=75, ge=1, le=180, description="Maximum seconds to approve each browser action."
+    )
+    web_replay_foreground: bool = False
     action_budget: int = Field(default=8, ge=1, le=12)
 
 

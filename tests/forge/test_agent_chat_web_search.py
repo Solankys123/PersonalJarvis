@@ -162,6 +162,8 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
     monkeypatch.setattr("jarvis.society.surface.current_runtime", lambda: runtime)
     monkeypatch.setattr("jarvis.society.runtime.current_runtime", lambda: runtime)
 
+    observed_controls = []
+
     class FixtureModel:
         calls = 0
 
@@ -171,10 +173,13 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
                 str(message.content) for message in request.messages if message.role == "user"
             )
             lines = observation.splitlines()
+            observed_controls.append(
+                (self.calls, [line for line in lines if "<input" in line or "<button" in line])
+            )
 
             def indexed(label, tag):
                 for line in reversed(lines):
-                    match = re.search(rf"\[(\d+)\]\s*<{tag}\b", line)
+                    match = re.search(rf"\[(\d+)\]:?\s*<{tag}\b", line)
                     if match and label in line:
                         return int(match[1])
                 return None
@@ -225,7 +230,7 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
     async def send(text, *, deny=None, cancel=None):
         approved = []
         await service.send(session_id, text)
-        async with asyncio.timeout(65):
+        async with asyncio.timeout(220 if dynamic else 65):
             while service.is_running(session_id):
                 for row in await approvals.items(state=ApprovalState.PENDING):
                     name = next(iter(row.action["action"]))
@@ -257,7 +262,7 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
         assert learned == (
             "FORGE procedure 1 is draft. Verification succeeded.",
             steps,
-        ), runtime.browser.live.sessions.get(caller.agent_id).stderr_tail
+        ), observed_controls
         assert await send("forge inspect 1") == (
             "FORGE procedure 1 is draft. Verified public search steps are "
             + (
@@ -313,7 +318,9 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
         )
         denied_prefix = steps[:2] if dynamic else steps[:3]
         assert (await send(f"{learn} {start_url} peppermint", deny="click")) == (
-            "FORGE stopped (browser_search_stopped).",
+            "FORGE stopped (browser_approval_denied)."
+            if dynamic
+            else "FORGE stopped (browser_search_stopped).",
             denied_prefix,
         )
         assert (await send(f"{learn} {start_url} mangosteen", cancel="click"))[1] == denied_prefix

@@ -14,10 +14,24 @@ from fastapi.testclient import TestClient
 
 from jarvis.agent_chat import runner_api
 from jarvis.agent_chat.catalog import rows_for
+from jarvis.agent_chat.runner_brain import build_override
 from jarvis.agent_chat.service import AgentChatService, SessionBusy
 from jarvis.agent_chat.store import AgentChatStore
 from jarvis.core.protocols import BrainDelta, BrainRequest
 from jarvis.ui.web.agent_chat_routes import router
+
+
+def test_typed_browser_turn_does_not_offer_voice_transcript_tool(tmp_path):
+    service = AgentChatService(AgentChatStore(":memory:"))
+    session = service.create_session(surface="jarvis", provider="openai", model="test-model")
+    override = build_override(
+        session, SimpleNamespace(), stance="ask", cwd=tmp_path, ref="agent-chat:test", kit_tools={}
+    )
+    browser, voice = object(), object()
+    shared = {"society_browser": browser, "session-latest-turn": voice}
+    assert override.tool_filter is not None
+    assert override.tool_filter(shared) == {"society_browser": browser}
+    assert shared["session-latest-turn"] is voice
 
 
 class ScriptedBrain:

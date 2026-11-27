@@ -7,6 +7,7 @@ import contextvars
 import json
 import logging
 import os
+import tempfile
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,6 +84,8 @@ class LiveSession:
     generation: str = ""
     closed: bool = False
     stderr_tail: str = ""
+    forge_progress: Callable[[str], Awaitable[None]] | None = None
+    forge_running: bool = False
     window_upgrade_pending: bool = False
 
     async def send(self, value: dict[str, Any]) -> None:
@@ -177,6 +180,26 @@ class LiveSession:
                     self.publish(event)
                 elif kind in {"frame", "pointer", "dialog", "download", "warning", "step"}:
                     self.publish(event)
+                elif kind == "forge_stage":
+                    log.info(
+                        "FORGE stage=%s status=%s elapsed_ms=%s",
+                        event.get("stage"),
+                        event.get("status"),
+                        event.get("elapsed_ms"),
+                    )
+                    if self.forge_progress and event.get("stage") == "visibility":
+                        status = event.get("status")
+                        if status == "foreground_denied":
+                            await self.forge_progress(
+                                "Windows declined foreground activation. "
+                                "Open Chrome from the taskbar."
+                            )
+                        elif status == "unsupported":
+                            await self.forge_progress(
+                                "Foreground activation is unavailable on this desktop."
+                            )
+                        elif status == "window_unavailable":
+                            await self.forge_progress("The isolated Chrome window is off-screen.")
                 elif kind == "fatal":
                     raise RuntimeError(event.get("error", "Browser worker failed"))
         except asyncio.CancelledError:
@@ -194,7 +217,8 @@ class LiveSession:
     async def drain_stderr(self) -> None:
         assert self.proc.stderr is not None
         while chunk := await self.proc.stderr.read(8192):
-            self.stderr_tail = (self.stderr_tail + chunk.decode("utf-8", "replace"))[-4000:]
+            if not self.forge_running:
+                self.stderr_tail = (self.stderr_tail + chunk.decode("utf-8", "replace"))[-4000:]
 
     async def watch_exit(self) -> None:
         """Reap descendants even if they keep the dead worker's pipes open.
@@ -351,8 +375,10 @@ class LiveSessions:
 
         self.idle_tasks[session.agent_id] = asyncio.create_task(expire())
 
-    async def ensure(self, agent: Any, *, window_view: bool = False) -> LiveSession:
-        agent_id = agent.agent_id
+    async def ensure(
+        self, agent: Any, *, window_view: bool = False, temporary_only: bool = False
+    ) -> LiveSession:
+        agent_id = f"forge:{agent.agent_id}" if temporary_only else agent.agent_id
         idle = self.idle_tasks.pop(agent_id, None)
         if idle:
             idle.cancel()
@@ -374,7 +400,7 @@ class LiveSessions:
                 await old.close()
             if not install.is_installed(self.data_dir):
                 await asyncio.to_thread(install.ensure_installed, self.data_dir)
-            folder = (self.data_dir / "society" / agent_id).resolve()
+            folder = (self.data_dir / "society" / agent.agent_id).resolve()
             tree = make_process_tree("agent-browser")
             process_options: dict[str, Any] = {"start_new_session": True} if os.name != "nt" else {}
             proc = await asyncio.create_subprocess_exec(
@@ -389,7 +415,7 @@ class LiveSessions:
                 **process_options,
             )
             tree.assign(proc.pid)
-            session = LiveSession(agent_id, proc, tree)
+            session = LiveSession(agent_id, proc, tree, forge_running=temporary_only)
             session.readers = [
                 asyncio.create_task(session.read()),
                 asyncio.create_task(session.drain_stderr()),
@@ -401,6 +427,7 @@ class LiveSessions:
                     {
                         "profile_dir": str(folder / "browser-profile"),
                         "window_view": window_view,
+                        "temporary_only": temporary_only,
                         "workspace": str(folder / "workspace"),
                         "executable": str(install.browser_executable(self.data_dir)),
                         "icon_path": str(
@@ -425,7 +452,8 @@ class LiveSessions:
                     "full_window": bool(result.get("full_window")),
                 }
                 self.sessions[agent_id] = session
-                self.release_when_idle(session)
+                if not temporary_only:
+                    self.release_when_idle(session)
                 return session
             except BaseException:
                 await session.close()
@@ -504,9 +532,26 @@ class LiveSessions:
         chat_session_id: str = "",
         public_search: dict | None = None,
         dynamic_search: dict | None = None,
+        forge_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict:
-        session = await self.ensure(agent)
-        await claim_browser(session, chat_session_id)
+        if dynamic_search is None:
+            session = await self.ensure(agent)
+        else:
+            if str(getattr(agent, "browser_mode", "own")) == "attach" or not install.is_installed(
+                self.data_dir
+            ):
+                return {"ok": False, "error": "managed_browser_required"}
+            try:
+                async with asyncio.timeout(dynamic_search.get("startup_seconds", 45)):
+                    session = await self.ensure(agent, temporary_only=True)
+            except TimeoutError:
+                log.warning("FORGE browser worker startup timed out")
+                return {"ok": False, "error": "browser_startup_timeout"}
+            except Exception as exc:
+                log.warning("FORGE browser worker startup failed: %s", type(exc).__name__)
+                return {"ok": False, "error": "browser_startup_failed"}
+        if dynamic_search is None:
+            await claim_browser(session, chat_session_id)
         if session.run_lock.locked() or session.control_owner:
             raise RuntimeError(_BUSY)
         async with session.run_lock:
@@ -516,8 +561,14 @@ class LiveSessions:
             session.rpc_context = contextvars.copy_context()
             session.active_trace = trace_id
             session.active_chat = chat_session_id
+            session.forge_progress = forge_progress
+            temporary = None
+            cleanup_failed = False
             try:
-                return await session.command(
+                if dynamic_search is not None:
+                    temporary = tempfile.TemporaryDirectory(prefix="jarvis-forge-")
+                    dynamic_search = {**dynamic_search, "temporary_profile": temporary.name}
+                result = await session.command(
                     "run",
                     {
                         "task": task,
@@ -534,7 +585,17 @@ class LiveSessions:
                 )
             except BaseException:
                 if not session.closed:
-                    await session.command("cancel", timeout=5)
+                    try:
+                        cleanup_wait = (
+                            5
+                            if dynamic_search is None
+                            else dynamic_search.get("cleanup_seconds", 16) + 2
+                        )
+                        await session.command("cancel", timeout=cleanup_wait)
+                    except Exception:
+                        log.warning("Browser cancellation acknowledgement failed; closing worker")
+                        if dynamic_search is None:
+                            await session.close()
                 raise
             finally:
                 for pending in list(session.tasks):
@@ -544,10 +605,30 @@ class LiveSessions:
                 session.rpc_context = None
                 session.active_trace = ""
                 session.active_chat = ""
+                session.forge_progress = None
                 if session.window_upgrade_pending:
                     session.publish({"kind": "disconnected"})
-                if not session.subscribers:
+                if dynamic_search is not None:
+                    self.sessions.pop(session.agent_id, None)
+                    try:
+                        await session.close()
+                    except TimeoutError:
+                        log.warning("FORGE browser tree closed with pending cleanup joins")
+                        cleanup_failed = True
+                    if temporary is not None:
+                        try:
+                            async with asyncio.timeout(5):
+                                await asyncio.to_thread(temporary.cleanup)
+                        except (OSError, TimeoutError) as exc:
+                            log.warning(
+                                "FORGE temporary profile cleanup failed: %s", type(exc).__name__
+                            )
+                            cleanup_failed = True
+                elif not session.subscribers:
                     self.release_when_idle(session)
+            if cleanup_failed and result.get("ok"):
+                return {"ok": False, "error": "browser_cleanup_failed"}
+            return result
 
     async def close(self) -> None:
         idle = list(self.idle_tasks.values())

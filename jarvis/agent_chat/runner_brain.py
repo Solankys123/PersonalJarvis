@@ -165,6 +165,7 @@ def build_override(
             dict(kit_tools) if kit_tools is not None else folder_tools(cwd, stance=stance)
         ),
         tool_filter=_compose_filters(
+            _typed_chat_tools,
             kit.tool_filter,
             kit.session_tool_filter(session) if kit.session_tool_filter is not None else None,
             plan_filter if stance == PLAN_STANCE else None,
@@ -184,6 +185,11 @@ def build_override(
         },
         max_turns=kit.max_turns or MAX_TURNS,
     )
+
+
+def _typed_chat_tools(tools: dict[str, Tool]) -> dict[str, Tool]:
+    """Keep voice transcript retrieval off the typed model's tool surface."""
+    return {name: tool for name, tool in tools.items() if name != "session-latest-turn"}
 
 
 def _compose_filters(
@@ -487,13 +493,20 @@ async def run_brain_turn(
         kit_tools=kit_tools,
         system_extra=system_extra,
     )
+
+    async def forge_progress(message: str) -> None:
+        await emit("reasoning_delta", {"turn_id": turn_id, "text": message + "\n"})
+
     override = replace(
         override,
         tool_context={
             **override.tool_context,
             "forge_interactive": forge_command,
             **(
-                {"forge_browser_model": (override.provider, override.model)}
+                {
+                    "forge_browser_model": (override.provider, override.model),
+                    "forge_progress": forge_progress,
+                }
                 if forge_command
                 else {}
             ),
@@ -622,7 +635,7 @@ async def _generate(
     # The task inherits the credential override through its context copy, so
     # the scoped brain instance resolves the Agents-tab key on first use.
     with override_provider_secrets(overrides):
-        if session.surface == "society":
+        if session.surface == "society" and not override.tool_context.get("forge_interactive"):
             from jarvis.society.conversation import prepare_history
             from jarvis.society.runtime import current_runtime
 

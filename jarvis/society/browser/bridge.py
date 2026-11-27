@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
+import time
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,35 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from jarvis.core.protocols import BrainMessage, BrainRequest, ImageBlock, ToolResult
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def _stage(name: str, seconds: float | None):
+    started = time.monotonic()
+    status = "ok"
+    deadline = asyncio.timeout(seconds)
+    try:
+        async with deadline:
+            yield
+    except TimeoutError:
+        status = "timeout" if deadline.expired() else "failed"
+        raise
+    except asyncio.CancelledError:
+        status = "cancelled"
+        raise
+    except Exception:
+        status = "failed"
+        raise
+    finally:
+        if seconds is not None:
+            logger.info(
+                "FORGE stage=%s status=%s elapsed_ms=%d",
+                name,
+                status,
+                (time.monotonic() - started) * 1000,
+            )
 
 
 def brain_messages(rows: list[dict[str, Any]]) -> tuple[BrainMessage, ...]:
@@ -60,10 +92,12 @@ class ApprovedBrowserAction:
         )
 
 
-async def wait_for_browser_approval(runtime: Any, approval_id: str, session: Any) -> bool:
+async def wait_for_browser_approval(
+    runtime: Any, approval_id: str, session: Any, *, seconds: float | None = None
+) -> bool:
     """A one-shot approval belongs to this task and is cancelled with it."""
     try:
-        async with asyncio.timeout(600):
+        async with _stage("approval", seconds), asyncio.timeout(600):
             while True:
                 row = await runtime.approvals.get(approval_id)
                 if row and str(row.state) == "approved":
@@ -72,6 +106,8 @@ async def wait_for_browser_approval(runtime: Any, approval_id: str, session: Any
                     return False
                 await asyncio.sleep(0.5)
     except TimeoutError:
+        if seconds is not None:
+            raise
         # The caller reports a declined action; the finally block clears the UI card.
         return False
     finally:
@@ -120,13 +156,25 @@ async def execute_live(
         )
         return ToolResult(False, None, error)
     brain, provider, overrides = None, None, {}
+    model_seconds = dynamic_search.get("model_seconds", 60) if dynamic_search is not None else None
+    progress = ctx.config.get("forge_progress") if dynamic_search is not None else None
+
+    async def report(message: str) -> None:
+        if callable(progress):
+            await progress(message)
+
     if public_search is None:
         provider = caller.provider or _default_provider(runtime)
         key = get_jarvis_agent_secret(provider)
         overrides = {provider: key} if key else {}
         try:
-            with override_provider_secrets(overrides):
-                brain = await asyncio.to_thread(live.model_resolver, caller)
+            await report("Preparing the selected browser model.")
+            async with _stage("model_setup", model_seconds):
+                with override_provider_secrets(overrides):
+                    brain = await asyncio.to_thread(live.model_resolver, caller)
+        except TimeoutError:
+            logger.warning("Browser model setup timed out")
+            return ToolResult(False, None, "browser_model_timeout")
         except LookupError:
             # A chat-only CLI must not fall back to an API-billed provider.
             if dynamic_search is not None:
@@ -147,6 +195,7 @@ async def execute_live(
     async def llm(payload: dict) -> dict:
         nonlocal vision_available
         assert brain is not None
+        await report("Choosing the next browser action.")
         all_messages = brain_messages(payload["messages"])
         messages = tuple(m for m in all_messages if m.role != "system")
         schema = payload.get("schema")
@@ -161,7 +210,9 @@ async def execute_live(
             messages=messages,
             system=system,
             tools=(),
-            max_tokens=min(getattr(brain, "context_window", 32768), 32768),
+            max_tokens=min(
+                getattr(brain, "context_window", 32768), 4096 if dynamic_search else 32768
+            ),
         )
         text = ""
         usage: dict = {}
@@ -174,12 +225,18 @@ async def execute_live(
                     + "\nImages are unavailable; use the DOM observation.",
                 )
             try:
-                with override_provider_secrets(overrides):
-                    async for delta in brain.complete(request):
-                        text += delta.content or ""
-                        if delta.usage:
-                            usage = delta.usage
+                async with _stage("model", model_seconds):
+                    with override_provider_secrets(overrides):
+                        async for delta in brain.complete(request):
+                            text += delta.content or ""
+                            if delta.usage:
+                                usage = delta.usage
                 break
+            except TimeoutError:
+                if dynamic_search is not None:
+                    logger.warning("FORGE browser model response timed out")
+                    return {"ok": False, "error": "browser_model_timeout"}
+                raise
             except Exception as exc:
                 detail = str(exc).lower()
                 if (
@@ -326,11 +383,29 @@ async def execute_live(
             session = live.sessions.get(caller.agent_id)
             if session:
                 session.publish({"kind": "approval", "id": approval.id, "action": name})
-            if not await wait_for_browser_approval(runtime, approval.id, session):
+            await report("Waiting for browser action approval.")
+            try:
+                approved = await wait_for_browser_approval(
+                    runtime,
+                    approval.id,
+                    session,
+                    seconds=dynamic_search.get("approval_seconds", 75)
+                    if dynamic_search is not None
+                    else None,
+                )
+            except TimeoutError:
+                logger.warning("FORGE browser approval timed out")
                 denied = True
+                return {"ok": False, "error": "browser_approval_timeout"}
+            if not approved:
+                denied = True
+                if dynamic_search is not None:
+                    return {"ok": False, "error": "browser_approval_denied"}
                 live.stop_turn(caller.agent_id, turn_trace)
                 return {"ok": False, "error": stopped_message}
         utterance = "FORGE public search" if forge_search else getattr(ctx, "user_utterance", "")
+        if dynamic_search is not None:
+            await report(dynamic_actions[name] + ".")
         result = await executor.execute(
             ApprovedBrowserAction(payload["apply"], read_only=read_only),
             {"action": proposal},
@@ -372,18 +447,23 @@ async def execute_live(
     if args.get("url"):
         task = f"Start at {args['url']}. " + task
     try:
+        await report("Starting the isolated browser.")
         result = await live.run(
             caller,
             task=task,
             max_steps=max(1, min(int(args.get("max_steps") or 25), 60)),
             llm=llm if public_search is None else None,
             action=action,
-            vision=bool(getattr(brain, "supports_vision", False)),
+            vision=dynamic_search is None and vision_available,
             files=files,
             trace_id=turn_trace,
             chat_session_id=chat_session_id,
             **({"public_search": public_search} if public_search is not None else {}),
-            **({"dynamic_search": dynamic_search} if dynamic_search is not None else {}),
+            **(
+                {"dynamic_search": dynamic_search, "forge_progress": report}
+                if dynamic_search is not None
+                else {}
+            ),
         )
     except Exception as exc:
         # The tool result reports the failure to both the chat and the planner.
@@ -397,6 +477,14 @@ async def execute_live(
             stopped_message if stopped else str(exc),
         )
     if forge_search is not None:
+        if dynamic_search is not None:
+            if result.get("ok"):
+                await report("Verified the search results and closed the isolated browser.")
+            logger.info(
+                "FORGE action_count=%d verification=%s",
+                len(verified_actions),
+                "verified" if result.get("ok") else "incomplete",
+            )
         return ToolResult(
             bool(result.get("ok")),
             {**result, "actions": verified_actions},

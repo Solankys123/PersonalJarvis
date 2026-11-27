@@ -5,15 +5,56 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import tempfile
-from contextlib import asynccontextmanager
+import logging
+import sys
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
+from time import monotonic
 from urllib.parse import parse_qs, urlsplit
 from uuid import uuid4
 
 
 class SearchStopped(Exception):
     pass
+
+
+log = logging.getLogger(__name__)
+
+
+async def _visibility(context, page_session, foreground):
+    if not foreground:
+        return "background"
+    if sys.platform != "win32":
+        return "unsupported"
+    from native_window import activate_owned_chrome  # type: ignore[import-not-found]
+
+    try:
+        # CDP normalizes a minimized window before the one native activation
+        # attempt. The handle is selected solely from this temporary browser's PID.
+        async with asyncio.timeout(3):
+            session = await context.browser.new_browser_cdp_session()
+            try:
+                target = await page_session.send("Target.getTargetInfo")
+                window = await session.send(
+                    "Browser.getWindowForTarget", {"targetId": target["targetInfo"]["targetId"]}
+                )
+                if window["bounds"]["windowState"] == "minimized":
+                    await session.send(
+                        "Browser.setWindowBounds",
+                        {"windowId": window["windowId"], "bounds": {"windowState": "normal"}},
+                    )
+                await page_session.send("Page.bringToFront")
+                processes = await session.send("SystemInfo.getProcessInfo")
+                pid = next(p["id"] for p in processes["processInfo"] if p["type"] == "browser")
+                visible, active = await asyncio.to_thread(activate_owned_chrome, int(pid))
+            finally:
+                await session.detach()
+    except Exception as exc:
+        log.debug("FORGE browser activation unavailable: %s", type(exc).__name__)
+        return "window_unavailable"
+    if not visible:
+        return "window_unavailable"
+    return "foreground" if active else "foreground_denied"
 
 
 class SearchCapture:
@@ -183,102 +224,164 @@ class SearchCapture:
         self.steps.append(step)
 
 
+async def _close_search(context, browser, limit):
+    async def close(operation, component, seconds):
+        task = asyncio.create_task(operation())
+        try:
+            done, _ = await asyncio.wait({task}, timeout=seconds)
+            if not done:
+                log.warning("FORGE browser teardown exceeded its deadline: %s", component)
+                return "timeout"
+            task.result()
+        except Exception as exc:
+            log.warning("FORGE browser teardown failed: %s %s", component, type(exc).__name__)
+            return "failed"
+        finally:
+            if not task.done():
+                task.cancel()
+        return "ok"
+
+    # Close the owner first. Browser-Use is a CDP client of this temporary
+    # context, and its shutdown events can stall while Chromium is still open.
+    context_status = await close(
+        context.close, "context", limit / 2 if browser is not None else limit
+    )
+    browser_status = (
+        await close(browser.reset, "engine", limit / 2) if browser is not None else "ok"
+    )
+    return max((browser_status, context_status), key=("ok", "failed", "timeout").index)
+
+
 @asynccontextmanager
-async def search_browser(worker, args, browser_class):
+async def search_browser(worker, args, browser_class, emit):
     """Fresh JavaScript-enabled profile with scoped read-only network access."""
     if not worker.owns_context:
         raise SearchStopped("managed_browser_required")
-    with tempfile.TemporaryDirectory(dir=worker.workspace, prefix="forge-") as temporary:
-        profile = Path(temporary)
-        context = await worker.launch_context(
-            str(profile),
-            executable_path=worker.browser_args["executable"],
-            headless=not bool(worker.native),
-            accept_downloads=False,
-            service_workers="block",
-            args=["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"],
-        )
-        try:
-            page = context.pages[0]
-            capture = SearchCapture(page, await context.new_cdp_session(page), args)
+    foreground = bool(args.get("foreground", True))
+    # The host removes the profile after it has reaped the owned worker. A
+    # Windows file lock during worker teardown cannot mask the run's result.
+    with nullcontext(Path(args["temporary_profile"])) as profile:
+        context = browser = None
+        started = monotonic()
 
-            async def route_request(route):
-                request = route.request
-                if (
-                    request.method != "GET"
-                    or not capture.same_origin(request.url)
-                    or not await worker.allowed_destination(request.url)
-                ):
-                    await route.abort()
-                    return
-                # Fetch without following redirects, since Playwright only routes
-                # the first request in a browser redirect chain.
-                try:
-                    headers = {
-                        key: value
-                        for key, value in request.headers.items()
-                        if key.lower() not in {"cookie", "authorization", "proxy-authorization"}
-                    }
-                    headers["cookie"] = ""
-                    response = await route.fetch(headers=headers, max_redirects=0, timeout=8000)
-                except Exception:
-                    # Report navigation failures without exposing the URL or request details.
-                    if request.is_navigation_request():
-                        capture.error = "browser_site_unreachable"
-                    await route.abort()  # The failed request is visible to the agent.
-                    return
-                try:
-                    headers = {
-                        key: value
-                        for key, value in response.headers.items()
-                        if key.lower() not in {"set-cookie", "content-disposition"}
-                    }
-                    if 300 <= response.status < 400 or (
-                        request.is_navigation_request()
-                        and (
-                            request.frame != page.main_frame
-                            or response.status >= 400
-                            or "text/html" not in headers.get("content-type", "").lower()
-                        )
-                    ):
-                        if request.is_navigation_request():
-                            capture.error = (
-                                "browser_restricted_page"
-                                if response.status in {401, 403, 429}
-                                else "browser_navigation_blocked"
-                            )
-                        await route.abort()
-                    else:
-                        await route.fulfill(response=response, headers=headers)
-                finally:
-                    await response.dispose()
-
-            await context.route("**/*", route_request)
-            await context.route_web_socket("**/*", lambda socket: socket.close())
-            async with asyncio.timeout(10):
-                port_file = profile / "DevToolsActivePort"
-                while True:
-                    try:
-                        port = int(port_file.read_text().splitlines()[0])
-                        break
-                    except (OSError, ValueError, IndexError):
-                        # Chromium may still be publishing the port file during startup.
-                        await asyncio.sleep(0.05)
-            browser = browser_class(
-                cdp_url=f"http://127.0.0.1:{port}",
-                keep_alive=True,
-                use_cloud=False,
-                enable_default_extensions=False,
-                captcha_solver=False,
-                auto_download_pdfs=False,
-                allowed_domains=[args["origin"]],
-                downloads_path=str(profile / "downloads"),
+        def report(stage, status, since):
+            emit(
+                "forge_stage",
+                stage=stage,
+                status=status,
+                elapsed_ms=int((monotonic() - since) * 1000),
             )
-            try:
-                await page.bring_to_front()
+
+        report("browser_startup", "started", started)
+        try:
+            async with asyncio.timeout(args.get("startup_seconds", 45)):
+                context = await worker.launch_context(
+                    str(profile),
+                    executable_path=worker.browser_args["executable"],
+                    headless=not foreground or sys.platform != "win32",
+                    accept_downloads=False,
+                    service_workers="block",
+                    args=["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"],
+                )
+                page = context.pages[0]
+                capture = SearchCapture(page, await context.new_cdp_session(page), args)
+
+                async def route_request(route):
+                    request = route.request
+                    if (
+                        request.method != "GET"
+                        or not capture.same_origin(request.url)
+                        or not await worker.allowed_destination(request.url)
+                    ):
+                        await route.abort()
+                        return
+                    # Fetch without following redirects, since Playwright only routes
+                    # the first request in a browser redirect chain.
+                    try:
+                        headers = {
+                            key: value
+                            for key, value in request.headers.items()
+                            if key.lower() not in {"cookie", "authorization", "proxy-authorization"}
+                        }
+                        headers["cookie"] = ""
+                        response = await route.fetch(headers=headers, max_redirects=0, timeout=8000)
+                    except Exception:
+                        # Report navigation failures without exposing the URL or request details.
+                        if request.is_navigation_request():
+                            capture.error = "browser_site_unreachable"
+                        await route.abort()  # The failed request is visible to the agent.
+                        return
+                    try:
+                        headers = {
+                            key: value
+                            for key, value in response.headers.items()
+                            if key.lower() not in {"set-cookie", "content-disposition"}
+                        }
+                        if 300 <= response.status < 400 or (
+                            request.is_navigation_request()
+                            and (
+                                request.frame != page.main_frame
+                                or response.status >= 400
+                                or "text/html" not in headers.get("content-type", "").lower()
+                            )
+                        ):
+                            if request.is_navigation_request():
+                                capture.error = (
+                                    "browser_restricted_page"
+                                    if response.status in {401, 403, 429}
+                                    else "browser_navigation_blocked"
+                                )
+                            await route.abort()
+                        else:
+                            await route.fulfill(response=response, headers=headers)
+                    finally:
+                        await response.dispose()
+
+                await context.route("**/*", route_request)
+                await context.route_web_socket("**/*", lambda socket: socket.close())
+                async with asyncio.timeout(10):
+                    port_file = profile / "DevToolsActivePort"
+                    while True:
+                        try:
+                            port = int(port_file.read_text().splitlines()[0])
+                            break
+                        except (OSError, ValueError, IndexError):
+                            # Chromium may still be publishing the port file during startup.
+                            await asyncio.sleep(0.05)
+                browser = browser_class(
+                    cdp_url=f"http://127.0.0.1:{port}",
+                    keep_alive=True,
+                    use_cloud=False,
+                    enable_default_extensions=False,
+                    captcha_solver=False,
+                    auto_download_pdfs=False,
+                    allowed_domains=[args["origin"]],
+                    downloads_path=str(profile / "downloads"),
+                )
                 await browser.start()
-                yield browser, capture, profile, uuid4().hex
-            finally:
-                await browser.stop()
+                visibility_started = monotonic()
+                visibility = await _visibility(context, capture.session, foreground)
+                report("visibility", visibility, visibility_started)
+                capture.visibility = visibility
+        except TimeoutError as exc:
+            report("browser_startup", "timeout", started)
+            raise SearchStopped("browser_startup_timeout") from exc
+        except asyncio.CancelledError:
+            report("browser_startup", "cancelled", started)
+            raise
+        except Exception as exc:
+            report("browser_startup", "failed", started)
+            log.warning("FORGE browser context startup failed: %s", type(exc).__name__)
+            raise SearchStopped("browser_startup_failed") from None
+        else:
+            report("browser_startup", "ok", started)
+            yield browser, capture, profile, uuid4().hex
         finally:
-            await context.close()
+            if context is not None:
+                started = monotonic()
+                report("browser_cleanup", "started", started)
+                status = await _close_search(context, browser, args.get("cleanup_seconds", 10))
+                report("browser_cleanup", status, started)
+                if status != "ok":
+                    if not sys.exc_info()[0]:
+                        raise SearchStopped(f"browser_cleanup_{status}")

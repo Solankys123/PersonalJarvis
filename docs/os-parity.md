@@ -1447,3 +1447,23 @@ container. Windows additionally has real subscription audio/delegation evidence
 with project API credentials disabled, and a native login-binary check with Node
 absent. These checks do not establish physical-device or latency parity on other
 platforms. The private upstream voice protocol remains experimental.
+
+### FORGE dynamic browser search
+
+On an interactive Windows desktop, learning and validation request foreground
+activation of the temporary Chromium window once. Windows can decline the
+request while another app has focus. Agent Chat then reports the outcome and
+the temporary window can be selected from the taskbar. Replay is headless by
+default. Set `forge.web_replay_foreground` for interactive Windows replay.
+On Linux and macOS, dynamic search uses the managed headless browser and reports
+that foreground activation is unavailable. Browser policy and verification
+apply in both window modes.
+
+Dynamic search uses `forge.web_run_seconds` (300 seconds by default, 30–540),
+`forge.web_model_seconds` (60, 1–180) and `forge.web_approval_seconds`
+(75, 1–180). Environment variables use the corresponding
+`JARVIS__FORGE__WEB_*` names. The outer deadline bounds consecutive stages
+even when individual stage limits would allow more time. The upper bound
+fits within the managed browser protocol's 600-second run limit. Startup,
+actions, result verification and cleanup have their own bounded waits.
+The existing `forge.run_seconds` setting still controls legacy workflows.

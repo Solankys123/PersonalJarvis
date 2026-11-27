@@ -119,11 +119,19 @@ class ForgeMindTool:
         limits: Limits,
         *,
         available_goals: frozenset[Goal] = frozenset(Goal),
+        web_seconds: float = 300,
+        web_model_seconds: float = 60,
+        web_approval_seconds: float = 75,
+        web_replay_foreground: bool = False,
     ) -> None:
         self._store = store
         self._open_target = open_target
         self._limits = limits
         self._available_goals = available_goals
+        self._web_seconds = web_seconds
+        self._web_model_seconds = web_model_seconds
+        self._web_approval_seconds = web_approval_seconds
+        self._web_replay_foreground = web_replay_foreground
         self._active: CancelToken | None = None
 
     @classmethod
@@ -138,6 +146,10 @@ class ForgeMindTool:
             fixture_factory(executor, memory_mb=config.memory_mb),
             Limits(config.attempts, config.run_seconds, config.action_budget),
             available_goals=frozenset({Goal.SUBMIT_MARKER}),
+            web_seconds=config.web_run_seconds,
+            web_model_seconds=config.web_model_seconds,
+            web_approval_seconds=config.web_approval_seconds,
+            web_replay_foreground=config.web_replay_foreground,
         )
 
     async def execute(self, args: dict[str, Any], ctx: ExecutionContext) -> ToolResult:
@@ -307,6 +319,11 @@ class ForgeMindTool:
                     "query": query,
                     "steps": expected,
                     "budget": self._limits.actions,
+                    "foreground": mode != "replay" or self._web_replay_foreground,
+                    "startup_seconds": 75,
+                    "cleanup_seconds": 16,
+                    "model_seconds": self._web_model_seconds,
+                    "approval_seconds": self._web_approval_seconds,
                 }
             }
             action_labels = {"input_text": "input", "verify_results": "done"}
@@ -330,15 +347,19 @@ class ForgeMindTool:
                 if caller is None or str(caller.state) != "active":
                     raise Refused("browser_agent_unavailable")
                 pick = ctx.config.get("forge_browser_model")
-                if not legacy and pick and all(pick) and (caller.provider, caller.model) != pick:
-                    caller = replace(caller, provider=pick[0], model=pick[1])
+                if not legacy and pick and pick[0]:
+                    selected = (pick[0], pick[1] or "")
+                    if (caller.provider, caller.model) != selected:
+                        caller = replace(caller, provider=selected[0], model=selected[1])
                 old = await asyncio.to_thread(self._store.claim, run_id, mode, version)
                 if old is not None:
                     return await self._result(*old)
                 outcome = "interrupted"
                 evidence: list[Evidence] = []
                 try:
-                    async with asyncio.timeout(self._limits.seconds):
+                    async with asyncio.timeout(
+                        self._limits.seconds if legacy else self._web_seconds
+                    ):
                         async with asyncio.TaskGroup() as group:
                             run = group.create_task(
                                 execute_live(
@@ -376,6 +397,16 @@ class ForgeMindTool:
                                 "browser_site_unreachable",
                                 "browser_search_model_failed",
                                 "browser_search_model_unavailable",
+                                "browser_model_timeout",
+                                "browser_approval_timeout",
+                                "browser_approval_denied",
+                                "browser_action_timeout",
+                                "browser_verification_timeout",
+                                "browser_startup_timeout",
+                                "browser_startup_failed",
+                                "browser_cleanup_timeout",
+                                "browser_cleanup_failed",
+                                "managed_browser_required",
                                 "search_results_unverified",
                                 "action_budget_exceeded",
                             }
@@ -412,7 +443,7 @@ class ForgeMindTool:
                     outcome = Verdict.SUCCESS
                 except TimeoutError:
                     # The receipt below reports the action deadline to the user.
-                    outcome = "budget_exceeded"
+                    outcome = "budget_exceeded" if legacy else "browser_session_timeout"
                 except asyncio.CancelledError:
                     outcome = "cancelled"
                     raise
@@ -422,6 +453,8 @@ class ForgeMindTool:
                 finally:
                     if token.is_cancelled():
                         outcome = "cancelled"
+                    if not legacy:
+                        logger.info("FORGE mode=%s outcome=%s", mode, outcome)
                     saved = await asyncio.to_thread(
                         self._store.record, run_id, mode, version, outcome, evidence, procedure
                     )

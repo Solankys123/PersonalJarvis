@@ -42,6 +42,36 @@ def test_native_mouse_routes_text_to_the_webpage_widget(tmp_path):
     assert '"badge": true' in result.stdout
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows widgets")
+def test_forge_foreground_and_unrelated_window_survives(tmp_path):
+    import json
+    import subprocess
+
+    from jarvis.core.process_utils import NO_WINDOW_CREATIONFLAGS
+
+    result = subprocess.run(
+        [
+            os.environ["JARVIS_BROWSER_TEST_PYTHON"],
+            str(Path(__file__).with_name("forge_window_probe.py")),
+            os.environ["JARVIS_BROWSER_TEST_EXECUTABLE"],
+            str(tmp_path),
+        ],
+        env=install.worker_env(tmp_path),
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+        creationflags=NO_WINDOW_CREATIONFLAGS,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    observed = json.loads(result.stdout)
+    assert observed["unrelated"] == "alive", result.stdout + result.stderr
+    assert observed["visibility"] in {"foreground", "foreground_denied"}, (
+        result.stdout + result.stderr
+    )
+    if os.environ.get("JARVIS_BROWSER_TEST_FOREGROUND"):
+        assert observed["visibility"] == "foreground", result.stdout + result.stderr
+
+
 def test_actual_browser_click_emits_pointer_telemetry(tmp_path):
     import subprocess
 

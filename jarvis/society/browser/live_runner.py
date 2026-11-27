@@ -10,6 +10,7 @@ import io
 import ipaddress
 import json
 import logging
+import math
 import os
 import random
 import socket
@@ -80,6 +81,7 @@ class Worker:
         self.playwright: Any = None
         self.agent: Any = None
         self.public_search = False
+        self.search_cleanup_error = ""
         self.job: asyncio.Task | None = None
         self.stream: asyncio.Task | None = None
         self.state_task: asyncio.Task | None = None
@@ -123,7 +125,8 @@ class Worker:
     async def start(self, args: dict) -> dict:
         from native_window import NativeWindow, available  # type: ignore[import-not-found]
 
-        native_enabled = available()
+        temporary_only = bool(args.get("temporary_only"))
+        native_enabled = not temporary_only and available()
         if args.get("window_view") and sys.platform == "win32" and not native_enabled:
             raise RuntimeError(
                 "Chrome needs an unlocked Windows desktop and the managed capture runtime"
@@ -131,13 +134,25 @@ class Worker:
 
         from playwright.async_api import async_playwright
 
-        profile = Path(args["profile_dir"])
-        await asyncio.to_thread(profile.mkdir, parents=True, exist_ok=True)
         self.workspace = Path(args["workspace"])
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.playwright = await async_playwright().start()
         cdp_url = args.get("cdp_url") or ""
         self.owns_context = not bool(cdp_url)
+        self.private_hosts = {
+            str(pattern).split("://")[-1].split("/")[0]
+            for pattern in args.get("allowed_domains", [])
+            if "*" not in str(pattern).split("://")[-1]
+        }
+        if temporary_only:
+            self.browser_args = {"executable": args["executable"]}
+            return {
+                "generation": self.generation,
+                "protocol": PROTOCOL_VERSION,
+                "full_window": False,
+            }
+        profile = Path(args["profile_dir"])
+        await asyncio.to_thread(profile.mkdir, parents=True, exist_ok=True)
         if cdp_url:
             connection = await self.playwright.chromium.connect_over_cdp(cdp_url)
             self.context = connection.contexts[0]
@@ -151,11 +166,6 @@ class Worker:
                 service_workers="block",
                 args=["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"],
             )
-        self.private_hosts = {
-            str(pattern).split("://")[-1].split("/")[0]
-            for pattern in args.get("allowed_domains", [])
-            if "*" not in str(pattern).split("://")[-1]
-        }
 
         async def route_request(route: Any) -> None:
             if await self.allowed_destination(route.request.url):
@@ -532,7 +542,11 @@ class Worker:
                 )
                 if not reply.get("ok"):
                     if capture is not None:
-                        capture.error = "browser_search_model_failed"
+                        capture.error = (
+                            "browser_model_timeout"
+                            if reply.get("error") == "browser_model_timeout"
+                            else "browser_search_model_failed"
+                        )
                         raise SearchStopped(capture.error)
                     raise RuntimeError(reply.get("error", "Jarvis model unavailable"))
                 text = reply["text"].strip()
@@ -583,11 +597,42 @@ class Worker:
                 return result
 
             async def record_action(self, action, proposal, browser_session, *pos, **kw):
+                async def stage(name, limit, operation):
+                    started = time.monotonic()
+                    emit("forge_stage", stage=name, status="started", elapsed_ms=0)
+                    status = "failed"
+                    try:
+                        async with asyncio.timeout(limit):
+                            value = await operation()
+                        status = "ok"
+                        return value
+                    except TimeoutError:
+                        status = "timeout"
+                        raise SearchStopped(f"browser_{name}_timeout") from None
+                    except asyncio.CancelledError:
+                        status = "cancelled"
+                        raise
+                    finally:
+                        emit(
+                            "forge_stage",
+                            stage=name,
+                            status=status,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                        )
+
                 name = next(iter(proposal))
                 if name == "input":
                     proposal = {"input_text": proposal[name]}
                     name = "input_text"
-                step, before, index = await capture.prepare(browser_session, proposal)
+                action_seconds = capture.args.get("action_seconds", 15)
+                verify_seconds = capture.args.get("verify_seconds", 10)
+                stage_name = "verification" if name == "done" else "action"
+                stage_seconds = verify_seconds if name == "done" else action_seconds
+
+                async def prepare():
+                    return await capture.prepare(browser_session, proposal)
+
+                step, _, _ = await stage(stage_name, stage_seconds, prepare)
                 answer = await worker.rpc(
                     "action",
                     {
@@ -597,19 +642,36 @@ class Worker:
                     },
                 )
                 if not answer.get("ok"):
-                    raise SearchStopped("browser_search_stopped")
+                    reason = answer.get("error")
+                    raise SearchStopped(
+                        reason
+                        if reason in {"browser_approval_timeout", "browser_approval_denied"}
+                        else "browser_search_stopped"
+                    )
                 permit = answer["permit"]
                 confirmation = asyncio.get_running_loop().create_future()
                 worker.pending[permit + ":result"] = confirmation
                 try:
                     try:
-                        checked, before, index = await capture.prepare(browser_session, proposal)
-                        if checked != step:
-                            raise SearchStopped("search_page_drift")
-                        result = await super().act(action, browser_session, *pos, **kw)
-                        if result.error or capture.error:
-                            raise SearchStopped(capture.error or "browser_action_failed")
-                        await capture.verify(browser_session, step, before, index)
+                        # Recheck the live target after the approval can have
+                        # suspended this action, before making any mutation.
+                        async def apply():
+                            checked, before, index = await prepare()
+                            if checked != step:
+                                raise SearchStopped("search_page_drift")
+                            result = await super(GatedTools, self).act(
+                                action, browser_session, *pos, **kw
+                            )
+                            if result.error or capture.error:
+                                raise SearchStopped(capture.error or "browser_action_failed")
+                            return result, before, index
+
+                        result, before, index = await stage(stage_name, stage_seconds, apply)
+                        await stage(
+                            "verification",
+                            verify_seconds,
+                            lambda: capture.verify(browser_session, step, before, index),
+                        )
                     except Exception as exc:
                         error = (
                             str(exc) if isinstance(exc, SearchStopped) else "browser_action_failed"
@@ -651,6 +713,17 @@ class Worker:
                         {"navigate": {"url": capture.args["url"], "new_tab": False}}
                     ],
                     "max_actions_per_step": 1,
+                    "max_failures": 2,
+                    # Host stage timers own the user-visible failure. Leave the
+                    # SDK enough time to receive the bounded RPC error and finish.
+                    "llm_timeout": math.ceil(capture.args.get("model_seconds", 60)) + 5,
+                    "step_timeout": math.ceil(
+                        capture.args.get("model_seconds", 60)
+                        + capture.args.get("approval_seconds", 75)
+                        + 2 * capture.args.get("action_seconds", 15)
+                        + 3 * capture.args.get("verify_seconds", 10)
+                        + 30
+                    ),
                     "enable_planning": False,
                     "use_judge": False,
                     "final_response_after_failure": False,
@@ -740,6 +813,8 @@ class Worker:
                 self.job.cancel()
                 if self.public_search:
                     await self.job
+                    if self.search_cleanup_error:
+                        raise RuntimeError(self.search_cleanup_error)
             return {}
         if op == "takeover":
             if self.public_search:
@@ -783,15 +858,20 @@ class Worker:
                 from dynamic_search import SearchStopped, search_browser  # type: ignore[import-not-found]
 
                 self.public_search = True
+                self.search_cleanup_error = ""
                 try:
-                    async with search_browser(self, args["dynamic_search"], Browser) as session:
+                    async with search_browser(
+                        self, args["dynamic_search"], Browser, emit
+                    ) as session:
                         browser, capture, profile, target_id = session
                         result = await self.run(
                             args, browser=browser, capture=capture, workspace=profile
                         )
-                        return {**result, "target_id": target_id}
+                        return {**result, "target_id": target_id, "visibility": capture.visibility}
                 except SearchStopped as exc:
                     # SearchStopped carries a safe diagnostic code to the chat.
+                    if str(exc) in {"browser_cleanup_failed", "browser_cleanup_timeout"}:
+                        self.search_cleanup_error = str(exc)
                     return {"ok": False, "error": str(exc)}
                 except Exception:
                     # Worker exceptions may include page data or temporary profile paths.
