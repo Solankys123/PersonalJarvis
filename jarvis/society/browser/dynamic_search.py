@@ -187,6 +187,39 @@ class SearchCapture:
         signature = hashlib.sha256(json.dumps(data["shape"]).encode()).hexdigest()
         return data["field"], data["value"], signature
 
+    async def replay_action(self, browser):
+        steps = self.args["steps"]
+        if len(self.steps) >= len(steps):
+            raise SearchStopped("search_page_drift")
+        name, _, fingerprint = steps[len(self.steps)].partition(":")
+        if name == "verify_results":
+            if not await self.observed_results():
+                raise SearchStopped("search_results_unverified")
+            self.finish_from_evidence = True
+            return {"done": {"text": "Results rendered", "success": True}}
+        if name == "send_keys":
+            return {"send_keys": {"keys": "Enter"}}
+        if name not in {"click", "input_text"}:
+            raise SearchStopped("search_page_drift")
+        await self.snapshot()
+        candidates = []
+        for index in await browser.get_selector_map():
+            if type(index) is not int or index <= 0:
+                continue
+            try:
+                field, _, observed = await self.target(browser, index)
+            except SearchStopped:
+                # The browser index includes links and other ineligible controls.
+                continue
+            if observed == fingerprint and (name == "click" or field):
+                candidates.append(index)
+        if len(candidates) != 1:
+            raise SearchStopped("search_page_drift")
+        params = {"index": candidates[0]}
+        if name == "input_text":
+            return {"input": {**params, "text": self.args["query"]}}
+        return {"click": params}
+
     def expect(self, step):
         expected = self.args["steps"]
         position = len(self.steps)

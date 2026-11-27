@@ -612,7 +612,6 @@ class AgentChatService:
             and incoming is None
             and not control_owned
             and control_runner is None
-            and text.lstrip()[:5].lower() == "forge"
         ):
             from jarvis.forge.tool import NAMESPACE
 

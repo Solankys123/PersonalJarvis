@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from dataclasses import asdict, replace
 from typing import Any
 
@@ -21,7 +22,8 @@ from .workflow import Goal, Marker, WorkflowProcedure, run_workflow
 logger = logging.getLogger(__name__)
 
 NAMESPACE = re.compile(
-    r"^forge\s+(?:learn|list|inspect|validate|promote|replay|stop|improve|rollback)\b",
+    r"^(?:forge\s+(?:learn|list|inspect|validate|promote|replay|stop|improve|rollback)\b"
+    r"|(?:learn to search|use what you learned to search) https?://)",
     re.ASCII | re.IGNORECASE,
 )
 JOB_PARAMETERS = r"(?:engineer|designer) (?:remote|onsite)"
@@ -39,8 +41,20 @@ WEB_COMMAND = re.compile(
 )
 
 
+SEARCH_OBJECTIVE = re.compile(
+    r"(learn to search|use what you learned to search) (https?://\S{1,2048}) "
+    r'for "([A-Za-z ]{2,99})"[.!]?',
+    re.ASCII | re.IGNORECASE,
+)
+
+
 def command(text: str) -> tuple[str, ...] | None:
     text = text.strip()
+    objective = SEARCH_OBJECTIVE.fullmatch(text)
+    if objective:
+        intent, url, query = objective.groups()
+        mode = "learn" if intent.lower() == "learn to search" else "replay"
+        return mode, "web", url, query
     web = WEB_COMMAND.fullmatch(text)
     if web:
         automatic, kind, mode, version, _, url, query = web.groups()
@@ -214,7 +228,7 @@ class ForgeMindTool:
                 if mode != "learn" and not isinstance(procedure, (LiveSearch, DynamicSearch)):
                     raise Refused("live_search_procedure_required")
                 saved = procedure if isinstance(procedure, (LiveSearch, DynamicSearch)) else None
-                return await self._run_live_search(
+                result = await self._run_live_search(
                     mode,
                     version,
                     saved,
@@ -223,6 +237,16 @@ class ForgeMindTool:
                     ctx,
                     legacy_learning=web_kind == "web-legacy",
                 )
+                if (
+                    mode == "replay"
+                    and isinstance(saved, DynamicSearch)
+                    and SEARCH_OBJECTIVE.fullmatch(ctx.user_utterance.strip())
+                    and result.error == "search_page_drift"
+                ):
+                    return await self._run_live_search(
+                        "learn", None, None, "", *params[-2:], ctx, parent=version
+                    )
+                return result
             if isinstance(procedure, (LiveSearch, DynamicSearch)):
                 raise Refused("public_search_parameters_required")
             if isinstance(procedure, BrowserProcedure) or (mode == "learn" and params[0] == "jobs"):
@@ -271,7 +295,10 @@ class ForgeMindTool:
         ctx: ExecutionContext,
         *,
         legacy_learning: bool = False,
+        parent: int | None = None,
     ) -> ToolResult:
+        from jarvis.society.approvals import Verdict as ApprovalVerdict
+        from jarvis.society.approvals import decide
         from jarvis.society.browser.bridge import execute_live
         from jarvis.society.runtime import current_runtime
 
@@ -318,6 +345,7 @@ class ForgeMindTool:
                     "url": url,
                     "query": query,
                     "steps": expected,
+                    "deterministic": mode in {"validate", "replay"},
                     "budget": self._limits.actions,
                     "foreground": mode != "replay" or self._web_replay_foreground,
                     "startup_seconds": 75,
@@ -360,6 +388,9 @@ class ForgeMindTool:
                     return await self._result(*old)
                 outcome = "interrupted"
                 evidence: list[Evidence] = []
+                started = time.monotonic()
+                model_calls = 0
+                auto_promote = False
                 try:
                     async with asyncio.timeout(
                         self._limits.seconds if legacy else self._web_seconds
@@ -383,6 +414,7 @@ class ForgeMindTool:
                         if token.is_cancelled():
                             raise Refused("cancelled")
                         result = run.result()
+                    model_calls = (result.output or {}).get("model_calls", 0)
                     if not result.success:
                         raise Refused(
                             result.error
@@ -444,6 +476,16 @@ class ForgeMindTool:
                         )
                         for index, step in enumerate(observed.steps, 1)
                     ]
+                    if mode == "validate" and isinstance(observed, DynamicSearch):
+                        current = await runtime.roster.get(runtime.lead_id)
+                        auto_promote = bool(
+                            current is not None
+                            and str(current.state) == "active"
+                            and "core:forge:promote"
+                            in current.approval_rules.get("always_allow", [])
+                            and decide(current, "core:forge", "monitor", verb="promote")
+                            is ApprovalVerdict.RUN
+                        )
                     outcome = Verdict.SUCCESS
                 except TimeoutError:
                     # The receipt below reports the action deadline to the user.
@@ -458,9 +500,23 @@ class ForgeMindTool:
                     if token.is_cancelled():
                         outcome = "cancelled"
                     if not legacy:
-                        logger.info("FORGE mode=%s outcome=%s", mode, outcome)
+                        logger.info(
+                            "FORGE mode=%s outcome=%s model_calls=%d elapsed_ms=%d",
+                            mode,
+                            outcome,
+                            model_calls,
+                            int((time.monotonic() - started) * 1000),
+                        )
                     saved = await asyncio.to_thread(
-                        self._store.record, run_id, mode, version, outcome, evidence, procedure
+                        self._store.record,
+                        run_id,
+                        mode,
+                        version,
+                        outcome,
+                        evidence,
+                        procedure,
+                        parent=parent,
+                        auto_promote=auto_promote,
                     )
                 return await self._result(*saved)
             finally:

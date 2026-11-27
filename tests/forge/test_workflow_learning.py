@@ -8,6 +8,11 @@ from contextlib import asynccontextmanager
 
 import pytest
 
+from jarvis.agent_chat.service import AgentChatService
+from jarvis.agent_chat.store import AgentChatStore
+from jarvis.brain.manager import BrainManager
+from jarvis.core.bus import EventBus
+from jarvis.core.config import JarvisConfig
 from jarvis.forge.desktop import WindowsFixture
 from jarvis.forge.engine import Limits
 from jarvis.forge.store import Store
@@ -285,4 +290,47 @@ async def test_runs_stored_version_two_procedure(workflow):
     assert (await tool.execute({}, context("forge validate 1 beta"))).success
     assert (await tool.execute({}, context("forge promote 1"))).success
     assert (await tool.execute({}, context("forge replay 1 beta"))).success
+    assert screens[-1].calls == ["unlock_b", "enter_marker", "submit"]
+
+
+@pytest.mark.asyncio
+async def test_desktop_workflow_through_agent_chat(workflow, monkeypatch):
+    _, screens, build = workflow
+    bus = EventBus()
+    config = JarvisConfig()
+    config.forge.enabled = True
+
+    async def unexpected(*args, **kwargs):
+        pytest.fail("The deterministic desktop workflow reached model generation")
+
+    def start():
+        forge = build()
+        brain = BrainManager(config, bus, tools={forge.name: forge}, tool_executor=executor())
+        monkeypatch.setattr(brain, "_generate", unexpected)
+        monkeypatch.setattr("jarvis.agent_chat.runner_brain.brain_manager", lambda: brain)
+        service = AgentChatService(AgentChatStore(":memory:"), bus=lambda: bus)
+        session = service.create_session(
+            surface="jarvis", provider="openai-codex", permission_mode="ask"
+        )
+        return service, session.session_id
+
+    async def send(service, session_id, text):
+        await service.send(session_id, text)
+        async with asyncio.timeout(5):
+            await service.wait_turn(session_id)
+        events = service.store.list_events(session_id)
+        return next(
+            row["payload"]["text"] for row in reversed(events) if row["kind"] == "assistant_text"
+        )
+
+    service, session_id = start()
+    assert "draft" in await send(service, session_id, "forge learn workflow alpha")
+    assert screens[-1].calls == ["unlock_a", "unlock_b", "enter_marker", "submit"]
+    assert "validated" in await send(service, session_id, "forge validate 1 beta")
+    assert "promoted" in await send(service, session_id, "forge promote 1")
+
+    service, session_id = start()
+    assert "Verification succeeded" in await send(service, session_id, "forge replay 1 beta")
+    assert screens[-1].phase == "submitted"
+    assert screens[-1].marker == "beta"
     assert screens[-1].calls == ["unlock_b", "enter_marker", "submit"]

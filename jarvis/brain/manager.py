@@ -10898,7 +10898,9 @@ class BrainManager:
         skill_state = _SkillTurnState(self)
         skill_token = _SKILL_TURN_STATE.set(skill_state)
         try:
-            if user_text.lstrip()[:5].lower() == "forge":
+            if user_text.lstrip().lower().startswith(
+                ("forge", "learn to search ", "use what you learned to search ")
+            ):
                 from jarvis.forge.tool import NAMESPACE, command, render_result
 
                 if NAMESPACE.match(user_text.lstrip()):

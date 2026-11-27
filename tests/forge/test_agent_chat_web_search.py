@@ -163,12 +163,14 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
     monkeypatch.setattr("jarvis.society.runtime.current_runtime", lambda: runtime)
 
     observed_controls = []
+    model_calls = []
 
     class FixtureModel:
         calls = 0
 
         async def complete(self, request):
             self.calls += 1
+            model_calls.append(self.calls)
             observation = "\n".join(
                 str(message.content) for message in request.messages if message.role == "user"
             )
@@ -270,7 +272,12 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
         else ["navigate", "input_text", "click", "verify_results"]
     )
     try:
-        learned = await send(f"{learn} {start_url} cobalt")
+        objective = (
+            f'Learn to search {start_url} for "cobalt"'
+            if dynamic
+            else f"{learn} {start_url} cobalt"
+        )
+        learned = await send(objective)
         assert learned == (
             "FORGE procedure 1 is draft. Verification succeeded.",
             steps,
@@ -290,19 +297,39 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
         assert (await send(f"forge validate 1 web {start_url} violet"))[0].endswith(
             "(independent_validation_required)."
         )
+        calls_after_learning = len(model_calls)
+        if dynamic:
+            assert calls_after_learning == 3
+            caller.approval_mode = "ask"
+            caller.approval_rules = {
+                "always_allow": [
+                    "core:forge:promote",
+                    *(f"core:browser:{step}" for step in steps),
+                ],
+            }
+        state = "promoted" if dynamic else "validated"
         assert await send(f"forge validate 1 web {start_url} amber") == (
-            "FORGE procedure 1 is validated. Verification succeeded.",
-            steps,
+            f"FORGE procedure 1 is {state}. Verification succeeded.",
+            [] if dynamic else steps,
         )
-        assert await send("forge promote 1") == ("FORGE procedure 1 promoted.", [])
+        if not dynamic:
+            assert await send("forge promote 1") == ("FORGE procedure 1 promoted.", [])
 
         await runtime.browser.live.close()
         service, session_id = start()
-        replay = "forge replay web" if dynamic else "forge replay 1 web"
-        assert await send(f"{replay} {start_url} green marble") == (
-            "FORGE procedure 1 is promoted. Verification succeeded.",
-            steps,
+        command = (
+            f'Use what you learned to search {start_url} for "green marble"'
+            if dynamic
+            else f"forge replay 1 web {start_url} green marble"
         )
+        assert await send(command) == (
+            "FORGE procedure 1 is promoted. Verification succeeded.",
+            [] if dynamic else steps,
+        )
+        assert len(model_calls) == calls_after_learning
+        # Revocation takes effect on the next action without clearing the skill.
+        caller.approval_mode = "always_ask"
+        caller.approval_rules = {}
         assert ("/results" if dynamic else "/catalog", "green marble", None) in search_site.requests
 
         search_site.list_tag = "ol"

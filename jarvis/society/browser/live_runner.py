@@ -533,6 +533,30 @@ class Worker:
             async def ainvoke(self, messages, output_format=None, **kwargs):
                 if capture is not None and capture.error:
                     raise SearchStopped(capture.error)
+                if capture is not None and capture.args.get("deterministic"):
+                    if output_format is None:
+                        raise SearchStopped("search_page_drift")
+                    try:
+                        async with asyncio.timeout(capture.args.get("verify_seconds", 10)):
+                            proposal = await capture.replay_action(browser)
+                    except TimeoutError:
+                        capture.error = "browser_verification_timeout"
+                        raise SearchStopped(capture.error) from None
+                    except SearchStopped as exc:
+                        capture.error = str(exc)
+                        raise
+                    return ChatInvokeCompletion(
+                        completion=output_format.model_validate(
+                            {
+                                "thinking": "",
+                                "evaluation_previous_goal": "",
+                                "memory": "",
+                                "next_goal": "Apply the next verified procedure step.",
+                                "action": [proposal],
+                            }
+                        ),
+                        usage=None,
+                    )
                 if capture is not None and output_format is not None:
                     try:
                         async with asyncio.timeout(capture.args.get("verify_seconds", 10)):

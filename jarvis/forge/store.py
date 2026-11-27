@@ -42,6 +42,18 @@ SCHEMA += LINEAGE_SCHEMA
 MIGRATE_V1 = "BEGIN IMMEDIATE;\n" + LINEAGE_SCHEMA
 
 
+@contextmanager
+def _savepoint(db: sqlite3.Connection):
+    db.execute("SAVEPOINT promote_candidate")
+    try:
+        yield
+    except Refused:
+        db.execute("ROLLBACK TO promote_candidate")
+        raise
+    finally:
+        db.execute("RELEASE promote_candidate")
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -214,6 +226,8 @@ class Store:
         evidence: list[Evidence],
         procedure: WorkflowProcedure | BrowserProcedure | LiveSearch | DynamicSearch | None = None,
         parent: int | None = None,
+        *,
+        auto_promote: bool = False,
     ) -> tuple[int | None, str]:
         final = evidence[-1] if evidence else None
         verified = (
@@ -273,6 +287,14 @@ class Store:
                     ).rowcount
                 if changed != 1:
                     outcome = "independent_validation_required"
+                elif auto_promote and isinstance(procedure, DynamicSearch):
+                    assert version is not None
+                    try:
+                        with _savepoint(db):
+                            self._promote(db, version)
+                    except Refused as exc:
+                        # Another version became active. Retain the validated draft and receipt.
+                        outcome = str(exc)
             db.execute(
                 "INSERT INTO runs VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET version=excluded.version, "
@@ -292,36 +314,38 @@ class Store:
             raise Refused("promotion_requires_authorization")
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute(
-                "SELECT parent FROM skill_lineage WHERE version=?", (version,)
-            ).fetchone()
-            if row:
-                changed = db.execute(
-                    "UPDATE procedures SET state='validated' WHERE version=? AND state='promoted'",
-                    row,
-                ).rowcount
-                if changed != 1:
-                    raise Refused("active_parent_required")
-            else:
-                active_child = db.execute(
-                    """WITH RECURSIVE descendants(version) AS (
-                        SELECT version FROM skill_lineage WHERE parent=?
-                        UNION
-                        SELECT s.version FROM skill_lineage s
-                        JOIN descendants d ON s.parent=d.version
-                    )
-                    SELECT 1 FROM descendants d JOIN procedures p USING (version)
-                    WHERE p.state='promoted' LIMIT 1""",
-                    (version,),
-                ).fetchone()
-                if active_child:
-                    raise Refused("active_descendant_exists")
+            self._promote(db, version)
+
+    @staticmethod
+    def _promote(db: sqlite3.Connection, version: int) -> None:
+        row = db.execute("SELECT parent FROM skill_lineage WHERE version=?", (version,)).fetchone()
+        if row:
             changed = db.execute(
-                "UPDATE procedures SET state='promoted' WHERE version=? AND state='validated'",
-                (version,),
+                "UPDATE procedures SET state='validated' WHERE version=? AND state='promoted'",
+                row,
             ).rowcount
             if changed != 1:
-                raise Refused("validated_draft_required")
+                raise Refused("active_parent_required")
+        else:
+            active_child = db.execute(
+                """WITH RECURSIVE descendants(version) AS (
+                    SELECT version FROM skill_lineage WHERE parent=?
+                    UNION
+                    SELECT s.version FROM skill_lineage s
+                    JOIN descendants d ON s.parent=d.version
+                )
+                SELECT 1 FROM descendants d JOIN procedures p USING (version)
+                WHERE p.state='promoted' LIMIT 1""",
+                (version,),
+            ).fetchone()
+            if active_child:
+                raise Refused("active_descendant_exists")
+        changed = db.execute(
+            "UPDATE procedures SET state='promoted' WHERE version=? AND state='validated'",
+            (version,),
+        ).rowcount
+        if changed != 1:
+            raise Refused("validated_draft_required")
 
     def rollback(self, version: int, *, authorized: bool) -> int:
         if not authorized:

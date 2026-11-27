@@ -68,7 +68,7 @@ def test_promoted_dynamic_search_lookup_after_reopen(tmp_path):
     steps = ("navigate", "input_text:" + "a" * 64, "click:" + "b" * 64, "verify_results")
     spec = DynamicSearch(origin, steps)
 
-    def evidence(target, length):
+    def evidence(target, length, actions=steps):
         return [
             Evidence(
                 target,
@@ -80,7 +80,7 @@ def test_promoted_dynamic_search_lookup_after_reopen(tmp_path):
                 "verified",
                 index,
             )
-            for index, step in enumerate(steps, 1)
+            for index, step in enumerate(actions, 1)
         ]
 
     assert store.record("learn", "learn", None, Verdict.SUCCESS, evidence("first", 6), spec) == (
@@ -99,6 +99,41 @@ def test_promoted_dynamic_search_lookup_after_reopen(tmp_path):
     assert reopened.promoted_search(origin) == 1
     assert reopened.promoted_search("https://other.test") is None
     assert reopened.get(1) == (spec, "promoted")
+
+    repaired_steps = ("navigate", "input_text:" + "c" * 64, "click:" + "d" * 64, "verify_results")
+    repaired = DynamicSearch(origin, repaired_steps)
+    assert reopened.record(
+        "repair",
+        "learn",
+        None,
+        Verdict.SUCCESS,
+        evidence("third", 5, repaired_steps),
+        repaired,
+        parent=1,
+    ) == (2, Verdict.SUCCESS)
+    assert reopened.record(
+        "same",
+        "validate",
+        2,
+        Verdict.SUCCESS,
+        evidence("fourth", 5, repaired_steps),
+        repaired,
+        auto_promote=True,
+    ) == (2, "independent_validation_required")
+    assert reopened.promoted_search(origin) == 1
+    assert reopened.record(
+        "changed",
+        "validate",
+        2,
+        Verdict.SUCCESS,
+        evidence("fifth", 9, repaired_steps),
+        repaired,
+        auto_promote=True,
+    ) == (2, Verdict.SUCCESS)
+    assert reopened.get(1) == (spec, "validated")
+    assert reopened.promoted_search(origin) == 2
+    assert reopened.rollback(2, authorized=True) == 1
+    assert reopened.promoted_search(origin) == 1
 
 
 def test_web_deadline_configuration_preserves_fixture_limit():

@@ -148,7 +148,9 @@ async def execute_live(
     if (caller.agent_id, turn_trace) in live.stopped_turns:
         return ToolResult(False, None, stopped_message)
     executor = live.executor() if callable(live.executor) else live.executor
-    if executor is None or (public_search is None and live.model_resolver is None):
+    deterministic = bool(dynamic_search and dynamic_search.get("deterministic"))
+    needs_model = public_search is None and not deterministic
+    if executor is None or (needs_model and live.model_resolver is None):
         error = (
             "browser_search_model_unavailable"
             if dynamic_search is not None
@@ -163,7 +165,7 @@ async def execute_live(
         if callable(progress):
             await progress(message)
 
-    if public_search is None:
+    if needs_model:
         provider = caller.provider or _default_provider(runtime)
         key = get_jarvis_agent_secret(provider)
         overrides = {provider: key} if key else {}
@@ -192,8 +194,10 @@ async def execute_live(
     usage_total = {"input_tokens": 0, "output_tokens": 0, "cache_hit_tokens": 0}
     vision_available = bool(getattr(brain, "supports_vision", False))
 
+    model_calls = 0
+
     async def llm(payload: dict) -> dict:
-        nonlocal vision_available
+        nonlocal vision_available, model_calls
         assert brain is not None
         await report("Choosing the next browser action.")
         all_messages = brain_messages(payload["messages"])
@@ -217,6 +221,7 @@ async def execute_live(
         text = ""
         usage: dict = {}
         for attempt in range(2):
+            model_calls += 1
             if not vision_available:
                 request = replace(
                     request,
@@ -457,7 +462,7 @@ async def execute_live(
             caller,
             task=task,
             max_steps=max(1, min(int(args.get("max_steps") or 25), 60)),
-            llm=llm if public_search is None else None,
+            llm=llm if needs_model else None,
             action=action,
             vision=dynamic_search is None and vision_available,
             files=files,
@@ -492,7 +497,7 @@ async def execute_live(
             )
         return ToolResult(
             bool(result.get("ok")),
-            {**result, "actions": verified_actions},
+            {**result, "actions": verified_actions, "model_calls": model_calls},
             "browser_search_stopped"
             if (caller.agent_id, turn_trace) in live.stopped_turns
             else result.get("error"),
