@@ -19,6 +19,7 @@ JSON frame and yields it as the brain response.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Mapping
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 from jarvis.core import config as cfg
@@ -318,16 +320,6 @@ class CodexBrain:
     name: str = "codex"
     context_window: int = 128_000
     supports_tools: bool = True
-    # supports_vision is RUNTIME, not a fixed True (mirrors can_call_tools): only
-    # the API-key path passes images to the model (complete() → stream_complete,
-    # which defaults supports_vision=True). The ChatGPT-subscription CLI
-    # (codex exec) flattens the turn to text via _build_cli_prompt and DROPS
-    # every image, so on the CLI path codex is BLIND. The Computer-Use screenshot
-    # loop skips supports_vision=False providers (screenshot_only_loop._call_brain),
-    # so a static True made CU hand a screenshot to a brain that cannot see it and
-    # plan blind. The class default is the safe blind value; __init__ flips it to
-    # True only when an API key (→ the vision-capable API path) is configured.
-    supports_vision: bool = False
     # The subscription CLI path has no dedicated system channel: structured
     # mode prepends the caller's contract to the flattened prompt
     # (render_structured_prompt). The subscription resolver prefers a sibling
@@ -377,8 +369,13 @@ class CodexBrain:
         except (TypeError, ValueError):
             budget = 0.0
         self._cli_timeout_s = budget if budget > 0 else _CLI_TIMEOUT_S
-        # Only the API-key path can see images (see the supports_vision note).
-        self.supports_vision = bool(self._api_key()) and not self._prefer_subscription
+
+    @property
+    def supports_vision(self) -> bool:
+        """Both the API and the isolated subscription CLI accept images."""
+        return (
+            bool(self._api_key()) and not self._prefer_subscription
+        ) or self.subscription_connected()
 
     @staticmethod
     def subscription_connected() -> bool:
@@ -567,13 +564,16 @@ class CodexBrain:
                 "Codex CLI not found — run 'npm i -g @openai/codex' and 'codex login'."
             )
 
-        prompt = self._render_prompt(req)
-        workdir = tempfile.mkdtemp(prefix="jarvis-codex-brain-")
+        images = [image for message in req.messages for image in message.images]
+        prompt = render_structured_prompt(req) if images else self._render_prompt(req)
         # OAuth env: drop OPENAI_API_KEY (so the subscription token wins) and
         # CODEX_HOME (a custom home breaks the global ~/.codex auth lookup).
         env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "CODEX_HOME")}
         _ensure_node_reachable(env, binary)
-        cmd = _build_cli_command(binary, self._cli_model, text_only=self._subscription_text_only)
+        cmd = _build_cli_command(
+            binary, self._cli_model, text_only=self._subscription_text_only or bool(images),
+        )
+        workdir = tempfile.mkdtemp(prefix="jarvis-codex-brain-")
         creationflags = NO_WINDOW_CREATIONFLAGS if sys.platform == "win32" else 0
         log.info(
             "CodexBrain CLI: spawning '%s exec' for the ChatGPT-login brain (prompt=%d chars)",
@@ -591,6 +591,15 @@ class CodexBrain:
             {} if sys.platform == "win32" else {"start_new_session": True}
         )
         try:
+            # Attach frames as model input. The child keeps the same tool
+            # restrictions as untrusted browser inference.
+            for index, image in enumerate(images):
+                suffix = ".jpg" if image.mime == "image/jpeg" else ".png"
+                path = Path(workdir) / f"frame-{index}{suffix}"
+                path.write_bytes(base64.b64decode(image.data_b64, validate=True))
+                cmd.extend(("--image", str(path)))
+            if images:
+                cmd.append("-")  # Read the prompt from stdin after the image options.
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=workdir,
@@ -601,11 +610,14 @@ class CodexBrain:
                 creationflags=creationflags,
                 **session_kwargs,
             )
-        except (FileNotFoundError, OSError) as exc:
+        except (OSError, ValueError) as exc:
             with suppress(OSError):
                 shutil.rmtree(workdir, ignore_errors=True)
             log.warning("CodexBrain CLI: spawn failed: %s", exc)
             raise RuntimeError(f"Codex CLI could not be launched: {exc}") from exc
+        except asyncio.CancelledError:
+            shutil.rmtree(workdir, ignore_errors=True)
+            raise
 
         try:
             assert proc.stdin is not None  # noqa: S101 — PIPE always present
@@ -737,7 +749,7 @@ class CodexBrain:
             )
             stream = (
                 self._complete_via_cli(req)
-                if self._subscription_text_only
+                if self._subscription_text_only or any(m.images for m in req.messages)
                 else self._complete_via_app_server(req)
             )
             async for delta in stream:
@@ -766,7 +778,7 @@ class CodexBrain:
             )
             stream = (
                 self._complete_via_cli(req)
-                if self._subscription_text_only
+                if self._subscription_text_only or any(m.images for m in req.messages)
                 else self._complete_via_app_server(req)
             )
             async for delta in stream:

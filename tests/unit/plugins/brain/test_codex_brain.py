@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from jarvis.core.protocols import BrainDelta, BrainMessage, BrainRequest
+from jarvis.core.protocols import BrainDelta, BrainMessage, BrainRequest, ImageBlock
 from jarvis.plugins.brain import codex as codex_module
 from jarvis.plugins.brain.codex import CodexBrain, _build_cli_command
 
@@ -270,11 +271,59 @@ def test_forced_subscription_reports_only_its_actual_capabilities(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(CodexBrain, "_api_key", lambda self: "sk-test")
+    monkeypatch.setattr(codex_module, "_codex_oauth_connected", lambda: False)
 
     brain = CodexBrain(prefer_subscription=True)
 
     assert brain.supports_vision is False
     assert brain.can_call_tools() is False
+
+
+@pytest.mark.asyncio
+async def test_subscription_vision_attaches_frames_to_isolated_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(CodexBrain, "_api_key", lambda self: None)
+    monkeypatch.setattr(codex_module, "_codex_oauth_connected", lambda: True)
+    monkeypatch.setattr(codex_module, "_resolve_codex_binary", lambda: "codex")
+    frames: list[Path] = []
+    prompt = bytearray()
+
+    async def drain() -> None:
+        return None
+
+    async def communicate() -> tuple[bytes, bytes]:
+        return (
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"seen"}}\n',
+            b"",
+        )
+
+    async def spawn(*args, **kwargs):
+        assert args[args.index("--sandbox") + 1] == "read-only"
+        assert "--ignore-user-config" in args
+        assert "shell_tool" in args
+        assert args[-1] == "-"
+        frames.extend(Path(args[i + 1]) for i, arg in enumerate(args) if arg == "--image")
+        assert [path.read_bytes() for path in frames] == [b"image A", b"image B"]
+        return SimpleNamespace(
+            stdin=SimpleNamespace(write=prompt.extend, drain=drain, close=lambda: None),
+            communicate=communicate,
+        )
+
+    monkeypatch.setattr(codex_module.asyncio, "create_subprocess_exec", spawn)
+    brain = CodexBrain(prefer_subscription=True)
+    request = BrainRequest(
+        system="Return the visible evidence.",
+        messages=(BrainMessage(role="user", content="Compare these frames.", images=(
+            ImageBlock("image/png", "aW1hZ2UgQQ=="),
+            ImageBlock("image/jpeg", "aW1hZ2UgQg=="),
+        )),),
+    )
+    assert brain.supports_vision
+    assert not brain.can_call_tools()
+    assert await _collect(brain.complete(request)) == "seen"
+    assert b"Return the visible evidence." in prompt
+    assert all(not path.exists() for path in frames)
 
 
 @pytest.mark.asyncio

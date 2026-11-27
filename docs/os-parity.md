@@ -705,7 +705,8 @@ visual-effect verification now use the same OS-neutral MSS/Pillow path on
 Windows, macOS and Linux/X11: a call-scoped capture session, deferred BGRX
 conversion, area-filtered thumbnails, and bounded polling with persistent
 effect confirmation. Windows' native window capture remains a capability-
-gated first choice with the shared rectangle path as its fallback. The
+gated first choice. A uniformly dark HWND placeholder falls back to the
+shared foreground-window rectangle capture. The
 macOS Screen Recording gate (a silent check before the engine acts; the grant
 itself is asked for at the first user-started capture, 2026-10-02 pass below),
 Wayland refusal and headless refusal are unchanged, so an unavailable capture

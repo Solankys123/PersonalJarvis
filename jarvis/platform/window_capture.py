@@ -153,6 +153,12 @@ def _grab_window_windows(
         return None
     with per_monitor_dpi_context():
         image = ImageGrab.grab(window=hwnd)
+    # PrintWindow can return a correctly sized, uniformly dark placeholder for
+    # a visible window. Let Computer-Use capture the same foreground rect.
+    if all(low == high and high <= 16 for low, high in image.getextrema()[:3]):
+        image.close()
+        log.debug("HWND capture returned a blank frame")
+        return None
     if tuple(image.size) != expected:
         from jarvis.platform.window_state import (  # noqa: PLC0415
             _window_client_rect_windows,

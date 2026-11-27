@@ -181,22 +181,18 @@ def test_offscreen_rects_do_not_intersect_virtual_desktop():
 
 
 def test_windows_capture_uses_hwnd_and_rejects_ambiguous_framing(monkeypatch):
+    from PIL import Image
+
     from jarvis.core import win32_dpi
     from jarvis.platform import window_capture as wc
 
     calls: list[int] = []
 
-    class _Image:
-        size = (101, 100)
-
-        def close(self):
-            pass
-
     monkeypatch.setattr(wc, "os", types.SimpleNamespace(name="nt"))
     monkeypatch.setattr(win32_dpi, "per_monitor_dpi_context", nullcontext)
     monkeypatch.setattr(
         "PIL.ImageGrab.grab",
-        lambda *, window: calls.append(window) or _Image(),
+        lambda *, window: calls.append(window) or Image.new("RGB", (101, 100), "white"),
     )
 
     assert wc._grab_window_windows(
@@ -204,6 +200,24 @@ def test_windows_capture_uses_hwnd_and_rejects_ambiguous_framing(monkeypatch):
         {"left": 0, "top": 0, "width": 100, "height": 100},
     ) is None
     assert calls == [0x1_0000_1234]
+
+
+def test_windows_capture_rejects_a_correctly_sized_dark_placeholder(monkeypatch):
+    from PIL import Image
+
+    from jarvis.core import win32_dpi
+    from jarvis.platform import window_capture as wc
+
+    monkeypatch.setattr(wc, "os", types.SimpleNamespace(name="nt"))
+    monkeypatch.setattr(win32_dpi, "per_monitor_dpi_context", nullcontext)
+    monkeypatch.setattr(
+        "PIL.ImageGrab.grab", lambda *, window: Image.new("RGB", (100, 100), (10, 10, 10)),
+    )
+
+    assert wc._grab_window_windows(
+        0x1_0000_1234,
+        {"left": 0, "top": 0, "width": 100, "height": 100},
+    ) is None
 
 
 def test_windows_client_capture_is_padded_into_frame_coordinates(monkeypatch):
