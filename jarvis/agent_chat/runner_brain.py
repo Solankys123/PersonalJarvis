@@ -506,6 +506,7 @@ async def run_brain_turn(
                 {
                     "forge_browser_model": (override.provider, override.model),
                     "forge_progress": forge_progress,
+                    "forge_ask": handle.request_approval,
                 }
                 if forge_command
                 else {}

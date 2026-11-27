@@ -373,26 +373,31 @@ async def execute_live(
                 if public_search is not None
                 else name
             )
-            approval = await runtime.approvals.enqueue(
-                agent_id=caller.agent_id,
-                trace_id=str(trace),
-                capability="core:browser",
-                action={"action": proposal, "resume_in_place": True},
-                summary=f"Browser: {description} on {payload.get('url', '')}"[:300],
-            )
-            session = live.sessions.get(caller.agent_id)
-            if session:
-                session.publish({"kind": "approval", "id": approval.id, "action": name})
+            summary = f"Browser: {description} on {payload.get('url', '')}"[:300]
+            chat_ask = ctx.config.get("forge_ask") if dynamic_search is not None else None
+            seconds = dynamic_search.get("approval_seconds", 75) if dynamic_search else None
             await report("Waiting for browser action approval.")
             try:
-                approved = await wait_for_browser_approval(
-                    runtime,
-                    approval.id,
-                    session,
-                    seconds=dynamic_search.get("approval_seconds", 75)
-                    if dynamic_search is not None
-                    else None,
-                )
+                if callable(chat_ask):
+                    async with _stage("approval", seconds):
+                        decision = await chat_ask(
+                            uuid4().hex, "forge_browser_action", {"action": proposal}, summary
+                        )
+                    approved = decision in {"allow", "allow_always"}
+                else:
+                    approval = await runtime.approvals.enqueue(
+                        agent_id=caller.agent_id,
+                        trace_id=str(trace),
+                        capability="core:browser",
+                        action={"action": proposal, "resume_in_place": True},
+                        summary=summary,
+                    )
+                    session = live.sessions.get(caller.agent_id)
+                    if session:
+                        session.publish({"kind": "approval", "id": approval.id, "action": name})
+                    approved = await wait_for_browser_approval(
+                        runtime, approval.id, session, seconds=seconds
+                    )
             except TimeoutError:
                 logger.warning("FORGE browser approval timed out")
                 denied = True

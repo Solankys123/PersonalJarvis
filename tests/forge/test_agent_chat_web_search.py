@@ -229,6 +229,21 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
         await service.send(session_id, text)
         async with asyncio.timeout(220 if dynamic else 65):
             while service.is_running(session_id):
+                for approval_id in service.pending_approvals(session_id):
+                    payload = next(
+                        event["payload"]
+                        for event in reversed(service.store.list_events(session_id))
+                        if event["kind"] == "approval_required"
+                        and event["payload"]["approval_id"] == approval_id
+                    )
+                    name = next(iter(payload["input"]["action"]))
+                    approved.append(name)
+                    if name == cancel:
+                        assert await service.cancel(session_id)
+                    else:
+                        assert service.resolve_approval(
+                            session_id, approval_id, "deny" if name == deny else "allow"
+                        )
                 for row in await approvals.items(state=ApprovalState.PENDING):
                     name = next(iter(row.action["action"]))
                     approved.append(name)

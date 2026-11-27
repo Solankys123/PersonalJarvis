@@ -120,8 +120,16 @@ class SearchCapture:
         expected = self.args["steps"]
         if expected and self.steps != list(expected[:-1]):
             return False
-        state = await self.snapshot()
-        return state[2]["renderedResults"] and self.matches_results(state)
+        # The page can finish navigation before its JavaScript search renders.
+        # Give that result a short window to appear before asking the model again.
+        deadline = monotonic() + 5
+        while True:
+            state = await self.snapshot()
+            if state[2]["renderedResults"] and self.matches_results(state):
+                return True
+            if monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.75)
 
     async def target(self, browser, index=None):
         if index is None:
