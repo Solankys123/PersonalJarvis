@@ -1467,3 +1467,7 @@ even when individual stage limits would allow more time. The upper bound
 fits within the managed browser protocol's 600-second run limit. Startup,
 actions, result verification and cleanup have their own bounded waits.
 The existing `forge.run_seconds` setting still controls legacy workflows.
+When the browser independently observes visible results matching the submitted
+query, it proposes final verification through the same approval gate. It
+rechecks the result after approval and retains the existing same-origin and
+request restrictions.

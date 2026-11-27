@@ -327,7 +327,7 @@ class ForgeMindTool:
                 }
             }
             action_labels = {"input_text": "input", "verify_results": "done"}
-            names = (step.split(":")[0] for step in expected)
+            names = (step.split(":")[0] for step in expected if step != "navigate")
             sequence = ", ".join(action_labels.get(name, name) for name in names)
             args = {
                 "task": (
@@ -336,7 +336,11 @@ class ForgeMindTool:
                     "Use indexed search controls or Enter. Use one action at a time. "
                     "Stop if login, consent, or CAPTCHA is required. "
                     "Finish successfully only when the rendered search results are visible."
-                    + (f" Follow this action order: {sequence}." if sequence else "")
+                    + (
+                        f" After automatic navigation, follow this action order: {sequence}."
+                        if sequence
+                        else ""
+                    )
                 ),
                 "max_steps": self._limits.actions,
             }

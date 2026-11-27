@@ -189,10 +189,7 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site,
             )
             assert query
             value = query[1]
-            if self.calls == 4:
-                assert f"Catalog matches for {value}" in observation
-                action = {"done": {"text": "Results rendered", "success": True}}
-            elif self.calls == 3:
+            if self.calls == 3:
                 action = {"click": {"index": indexed("Find items", "button")}}
             elif self.calls == 2:
                 action = {"input": {"index": indexed("Catalog query", "input"), "text": value}}

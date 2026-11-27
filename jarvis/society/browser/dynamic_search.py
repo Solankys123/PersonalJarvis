@@ -58,15 +58,17 @@ async def _visibility(context, page_session, foreground):
 
 
 class SearchCapture:
-    def __init__(self, page, session, args):
+    def __init__(self, page, session, args, emit):
         self.page = page
         self.session = session
         self.args = args
+        self.emit = emit
         self.steps: list[str] = []
         self.input_seen = False
         self.initial = None
         self.last_submit = None
         self.error = None
+        self.finish_from_evidence = False
 
     def same_origin(self, url):
         parts = urlsplit(url)
@@ -85,8 +87,19 @@ class SearchCapture:
                     'input[type=password],iframe[src*="captcha" i],[id*="captcha" i],'
                     + '[class*="captcha" i],input[autocomplete^="cc-" i]');
                 const text = document.body?.innerText.slice(0, 64000) || '';
+                const visible = element => element.getClientRects().length > 0
+                    && getComputedStyle(element).visibility === 'visible';
+                const searchLinks = Array.from(document.querySelectorAll(
+                    '[id*="search-results" i] a[href], [class~="search-results" i] a[href]'
+                ));
+                const resultHeadings = document.querySelectorAll('h1,h2,[role=heading]');
                 return {blocked: !!blocked, text,
                     matched: text.toLowerCase().includes(query.toLowerCase()),
+                    renderedResults: searchLinks.some(visible) || Array.from(resultHeadings).some(
+                        heading => visible(heading) && /\\b(results?|matches)\\b/i.test(
+                            heading.innerText
+                        ) && heading.innerText.toLowerCase().includes(query.toLowerCase())
+                    ),
                     active: document.activeElement?.tagName || ''};
             }""",
             self.args["query"],
@@ -94,6 +107,21 @@ class SearchCapture:
         if state["blocked"]:
             raise SearchStopped("browser_restricted_page")
         return self.page.url, hashlib.sha256(state["text"].encode()).digest(), state
+
+    def matches_results(self, state):
+        query = self.args["query"]
+        url_query = parse_qs(urlsplit(state[0]).query)
+        matched = state[2]["matched"] or any(query in values for values in url_query.values())
+        return state[1] != self.initial and state[:2] != self.last_submit and matched
+
+    async def observed_results(self):
+        if self.last_submit is None:
+            return False
+        expected = self.args["steps"]
+        if expected and self.steps != list(expected[:-1]):
+            return False
+        state = await self.snapshot()
+        return state[2]["renderedResults"] and self.matches_results(state)
 
     async def target(self, browser, index=None):
         if index is None:
@@ -169,17 +197,20 @@ class SearchCapture:
         before = await self.snapshot()
         if name == "done":
             self.expect("verify_results")
-            query = self.args["query"]
-            url_query = parse_qs(urlsplit(before[0]).query)
-            matched = before[2]["matched"] or any(query in values for values in url_query.values())
-            if (
-                params.get("success") is not True
-                or not self.input_seen
-                or self.last_submit is None
-                or before[1] == self.initial
-                or before[:2] == self.last_submit
-                or not matched
-            ):
+            if params.get("success") is not True:
+                reason = "model_declined"
+            elif not self.input_seen or self.last_submit is None:
+                reason = "missing_search_action"
+            elif before[1] == self.initial or before[:2] == self.last_submit:
+                reason = "page_unchanged"
+            elif not self.matches_results(before):
+                reason = "query_unconfirmed"
+            elif self.finish_from_evidence and not before[2]["renderedResults"]:
+                reason = "rendered_results_missing"
+            else:
+                reason = ""
+            if reason:
+                self.emit("forge_stage", stage="result_evidence", status=reason, elapsed_ms=0)
                 raise SearchStopped("search_results_unverified")
             return "verify_results", before, None
         index = params.get("index")
@@ -284,7 +315,7 @@ async def search_browser(worker, args, browser_class, emit):
                     args=["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"],
                 )
                 page = context.pages[0]
-                capture = SearchCapture(page, await context.new_cdp_session(page), args)
+                capture = SearchCapture(page, await context.new_cdp_session(page), args, emit)
 
                 async def route_request(route):
                     request = route.request

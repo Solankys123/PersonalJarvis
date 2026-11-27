@@ -533,6 +533,32 @@ class Worker:
             async def ainvoke(self, messages, output_format=None, **kwargs):
                 if capture is not None and capture.error:
                     raise SearchStopped(capture.error)
+                if capture is not None and output_format is not None:
+                    try:
+                        async with asyncio.timeout(capture.args.get("verify_seconds", 10)):
+                            observed_results = await capture.observed_results()
+                    except TimeoutError as exc:
+                        capture.error = "browser_verification_timeout"
+                        raise SearchStopped(capture.error) from exc
+                    if observed_results:
+                        capture.finish_from_evidence = True
+                        emit(
+                            "forge_stage", stage="result_evidence", status="rendered", elapsed_ms=0
+                        )
+                        return ChatInvokeCompletion(
+                            completion=output_format.model_validate(
+                                {
+                                    "thinking": "",
+                                    "evaluation_previous_goal": "Rendered search results observed.",
+                                    "memory": "",
+                                    "next_goal": "Verify results through the browser.",
+                                    "action": [
+                                        {"done": {"text": "Results rendered", "success": True}}
+                                    ],
+                                }
+                            ),
+                            usage=None,
+                        )
                 reply = await worker.rpc(
                     "llm",
                     {
