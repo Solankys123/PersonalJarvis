@@ -14,6 +14,7 @@ from jarvis.brain.manager import BrainManager
 from jarvis.core.bus import EventBus
 from jarvis.core.config import JarvisConfig
 from jarvis.core.protocols import BrainDelta, ToolResult
+from jarvis.forge.tool import ForgeMindTool
 from jarvis.safety.approval import ApprovalWorkflow
 from jarvis.safety.risk_tier import RiskTierEvaluator
 from jarvis.safety.tool_executor import ToolExecutor
@@ -199,3 +200,76 @@ async def test_subscription_reuses_reloaded_skill_with_changed_inputs(mastery_ch
     assert binding_model.calls == 1
     assert (cwd / "reuse.csv").read_text(encoding="utf-8") == "fruit,count\napple,11\n"
     assert not service.pending_approvals(sid)
+
+
+@pytest.mark.parametrize("verified", [False, True])
+async def test_adaptive_browser_mastery_and_reuse(mastery_chat, monkeypatch, verified):
+    service, cwd, registry = mastery_chat
+    url = "https://example.org/search"
+    queries = []
+
+    class BrowserForge(ForgeMindTool):
+        async def _run_live_search(self, mode, version, procedure, state, entry, query, ctx):
+            assert mode == "mastery" and entry == url
+            ctx.config["forge_search_guard"]()
+            if not queries:
+                assert await ctx.config["forge_ask"]("id", "action", {}, "search") == "allow"
+            queries.append(query)
+            return ToolResult(verified, None, None if verified else "search_results_unverified")
+
+    class BrowserModel:
+        calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                yield BrainDelta(content="Python CSV official documentation")
+                return
+            prompt = request.messages[0].content
+            assert '"browser_search"' in prompt
+            result = {"browser_search": {
+                "url": url, "query": "sample jobs" if self.calls == 2 else "design jobs",
+            }}
+            if self.calls == 2:
+                result.update(
+                    name="public-jobs", description="Find jobs using a public search form.",
+                    phrases=["search public jobs"], knowledge=f"Reference {DOCS}.",
+                    method="Search the public job board and check the rendered results.",
+                )
+            yield BrainDelta(content=json.dumps(result))
+
+    from jarvis.agent_chat.runner_brain import brain_manager
+
+    brain_manager()._tools.update({
+        "forge_mind": BrowserForge(None, None, None),
+        "society_browser": SearchTool(),
+    })
+    model = BrowserModel()
+    monkeypatch.setattr("jarvis.agent_chat.browser_model.browser_model_for", lambda *_: model)
+    session = service.create_session(
+        surface="jarvis", provider="openai-codex", cwd=str(cwd), permission_mode="ask",
+    )
+    sid = session.session_id
+    events = service.subscribe(sid)
+    await service.send(sid, "Learn and master how to search public jobs")
+    async with asyncio.timeout(5):
+        while (event := await events.get())["kind"] != "approval_required":
+            assert event["kind"] != "turn_finished", event
+    card = event["payload"]
+    assert card["name"] == "forge_mastery"
+    assert card["input"]["exercise"] == {"url": url, "query": "sample jobs"}
+    assert not queries
+    assert service.resolve_approval(sid, card["approval_id"], "allow")
+    await asyncio.wait_for(service.wait_turn(sid), timeout=5)
+    assert queries == ["sample jobs"]
+    assert [row["payload"]["name"] for row in service.store.list_events(sid)
+            if row["kind"] == "approval_required"] == ["forge_mastery"]
+    assert bool(registry.list_active()) == verified
+    if verified:
+        restarted = SkillRegistry(registry.root)
+        restarted.reload_sync()
+        set_skill_context(SkillContext(restarted, SkillRunner(restarted)))
+        await service.send(sid, "Search public jobs for design jobs")
+        await asyncio.wait_for(service.wait_turn(sid), timeout=5)
+        assert queries == ["sample jobs", "design jobs"]
+        assert model.calls == 3

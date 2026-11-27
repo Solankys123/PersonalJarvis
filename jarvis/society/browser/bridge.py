@@ -289,6 +289,9 @@ async def execute_live(
 
     async def action(payload: dict) -> dict:
         nonlocal denied
+        guard = ctx.config.get("forge_search_guard") if dynamic_search is not None else None
+        if callable(guard):
+            guard()
         if denied or await runtime.store.kill_switch():
             return {"ok": False, "error": "Browser action cancelled or denied"}
         current = await runtime.roster.get(caller.agent_id)

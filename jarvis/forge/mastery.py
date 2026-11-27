@@ -16,7 +16,11 @@ from jarvis.core.redact import redact_secrets
 from jarvis.core.tool_read_only import allows_read
 from jarvis.skills.authoring.service import slugify
 
+from .engine import Refused
+from .live_navigation import search_origin
+
 TAG = "forge-mastery"
+BROWSER_SEARCH_GUIDANCE = "## Verified public browser search"
 _COMMAND = re.compile(
     r"(?:master (this skill|the previous task)|learn and master\s+(.+?))[.!]?\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -113,6 +117,7 @@ def search_references(result: Any) -> list[dict[str, str]]:
 
 def planning_prompt(
     task: str, tools: Mapping[str, Tool], prior: Any | None, references: list[dict[str, str]],
+    *, browser_search: bool = False,
 ) -> str:
     catalog = {
         name: {"description": tool.description[:280], "schema": tool.schema}
@@ -125,8 +130,9 @@ def planning_prompt(
         "name (short stable kebab-case), description, phrases (2-5 short literal action phrases "
         "users would say, with variable inputs omitted), knowledge (Markdown covering methods, "
         "parameters, failure handling and linked research), method (Markdown describing the "
-        "specific procedure to verify, reusable with changed inputs), steps (1-4 objects with tool "
-        "and args), and check (object with tool, args, and expected, a list of exact nonempty "
+        "specific procedure to verify, reusable with changed inputs). For a direct tool exercise, "
+        "include steps (1-4 objects with tool and args) and check (object with tool, args, "
+        "and expected, a list of exact nonempty "
         "substrings that all must appear in the independent observation). Use an independent "
         "read-only call for check. For a numbered Read result, expected can be an exact "
         "line fragment or fragments. Pick a scoped exercise with only synthetic inputs, a "
@@ -135,7 +141,15 @@ def planning_prompt(
         "Keep exact arguments, exercise data, personal information and credentials out of "
         "name, description, phrases, knowledge and method. If no independently verifiable "
         "exercise exists, return {}. Do not execute the exercise in this phase.\n\n"
-        "Available exercise tools:\n" + json.dumps(catalog, ensure_ascii=False)
+        + (
+            'For a public website search, use "browser_search": {"url": "https://site/path", '
+            '"query": "synthetic search words"} instead of steps and check. Use the public '
+            'search entry URL without query parameters and one to four alphabetic words. '
+            'The existing adaptive browser will locate controls and independently verify '
+            'the rendered results. No login, account changes, or uploads.\n\n'
+            if browser_search else ""
+        )
+        + "Available exercise tools:\n" + json.dumps(catalog, ensure_ascii=False)
         + "\n\nPublic search results:\n" + json.dumps(references, ensure_ascii=False)
         + ("\n\nExisting skill (preserve trusted guidance):\n" + prior.body if prior else "")
         + "\n\nUser task:\n" + task
@@ -144,6 +158,14 @@ def planning_prompt(
 
 def reuse_prompt(task: str, instructions: str, tools: Mapping[str, Tool]) -> str:
     catalog = {name: tool.schema for name, tool in tools.items()}
+    if BROWSER_SEARCH_GUIDANCE in instructions:
+        return (
+            'Bind the verified public browser search to the current request. Return JSON with '
+            '"browser_search": {"url": "https://site/path", "query": "search words"}. '
+            'Use the same site as the verified method and the query explicitly requested by '
+            'the user. If the query is missing or the method does not apply, return {}.\n\n'
+            "Verified method:\n" + instructions + "\n\nCurrent request:\n" + task
+        )
     return (
         "Apply the previously verified procedure below to the current user request. "
         "Keep the procedure and bind only the current input values. "
@@ -171,7 +193,26 @@ class Exercise:
 
 
 @dataclass(frozen=True)
-class Proposal(Exercise):
+class BrowserSearch:
+    url: str
+    query: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.url, str) or not isinstance(self.query, str):
+            raise ValueError("Browser search requires a URL and query.")
+        search_origin(self.url, self.query)
+
+
+def matches_browser_scope(instructions: str, search: BrowserSearch, task: str) -> bool:
+    return (
+        f"Verified search entry: {search.url}" in instructions.splitlines()
+        and re.search(rf"\b{re.escape(search.query)}\b", task, re.IGNORECASE) is not None
+    )
+
+
+@dataclass(frozen=True)
+class Proposal:
+    practice: Exercise | BrowserSearch
     name: str
     description: str
     phrases: tuple[str, ...]
@@ -179,29 +220,46 @@ class Proposal(Exercise):
     method: str
 
     def instructions(self) -> str:
+        method = self.method
+        if isinstance(self.practice, BrowserSearch):
+            method = f"Verified search entry: {self.practice.url}\n\n" + method
         return (
             "## Researched guidance\n\n" + self.knowledge
-            + "\n\n## Practically verified method\n\n" + self.method
+            + "\n\n" + (
+                BROWSER_SEARCH_GUIDANCE if isinstance(self.practice, BrowserSearch)
+                else "## Practically verified method"
+            ) + "\n\n" + method
             + "\n\nApply this guidance to current user inputs and check the result. "
             "Use current tool permissions and stop when verification fails.\n"
         )
 
     def approval_input(self) -> dict[str, Any]:
+        practice = self.practice
+        if isinstance(practice, BrowserSearch):
+            scope = {
+                "exercise": {"url": practice.url, "query": practice.query},
+                "verify": "Check rendered search results in the browser before saving.",
+            }
+        else:
+            scope = {
+                "exercise": [{"tool": call.tool, "args": call.args} for call in practice.steps],
+                "verify": {"tool": practice.check.tool, "args": practice.check.args,
+                           "expected": list(practice.expected)},
+            }
         return {
             "skill": self.name,
             "description": self.description,
             "trigger_phrases": list(self.phrases),
             "research": self.knowledge,
             "method": self.method,
-            "exercise": [{"tool": call.tool, "args": call.args} for call in self.steps],
-            "verify": {"tool": self.check.tool, "args": self.check.args,
-                       "expected": list(self.expected)},
+            **scope,
         }
 
 
 def parse_proposal(
     reply: str, tools: Mapping[str, Tool], *, reuse: bool = False,
-) -> Proposal | Exercise | None:
+    browser_search: bool = False,
+) -> Proposal | Exercise | BrowserSearch | None:
     from jarvis.agent_chat.folder_tools import FolderTool
     from jarvis.agent_chat.tools import READ_ONLY_TOOLS
 
@@ -222,13 +280,7 @@ def parse_proposal(
             raise ValueError
         return tuple(short_text(item, limit) for item in value)
 
-    try:
-        reply = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", reply.strip())
-        if len(reply) > 16_000 or redact_secrets(reply) != reply:
-            raise ValueError
-        data = json.loads(reply)
-        if reuse and data == {}:
-            return None
+    def parse_exercise(data: dict) -> Exercise:
         steps = tuple(call(row) for row in data["steps"])
         check = call(data["check"])
         verifier = tools[check.tool]
@@ -249,20 +301,38 @@ def parse_proposal(
         ):
             raise ValueError
         expected = strings(data["check"]["expected"], 6, 350)
+        return Exercise(steps, check, expected)
+
+    try:
+        reply = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", reply.strip())
+        if len(reply) > 16_000 or redact_secrets(reply) != reply:
+            raise ValueError
+        data = json.loads(reply)
+        if reuse and data == {}:
+            return None
+        if browser_search and "browser_search" in data:
+            practice = BrowserSearch(**data["browser_search"])
+            if "steps" in data or "check" in data:
+                raise ValueError
+        else:
+            practice = parse_exercise(data)
         if reuse:
-            return Exercise(steps, check, expected)
+            return practice
         name = slugify(short_text(data["name"], 64))
         phrases = strings(data["phrases"], 5, 90)
         if not name or any(not re.fullmatch(r"[\w -]+", phrase) or
                            len(phrase.split()) < 2 for phrase in phrases):
             raise ValueError
         proposal = Proposal(
-            steps, check, expected, name, short_text(data["description"], 400), phrases,
+            practice, name, short_text(data["description"], 400), phrases,
             short_text(data["knowledge"], 3500), short_text(data["method"], 2500),
         )
         durable = "\n".join((name, proposal.description, *phrases,
                               proposal.knowledge, proposal.method)).casefold()
-        for step in (*steps, check):
+        if isinstance(practice, BrowserSearch) and practice.query.casefold() in durable:
+            raise ValueError
+        calls = (*practice.steps, practice.check) if isinstance(practice, Exercise) else ()
+        for step in calls:
             for key, value in step.args.items():
                 if key in {"file_path", "content", "password", "token", "secret"} and (
                     key in {"password", "token", "secret"}
@@ -276,7 +346,7 @@ def parse_proposal(
         if safe_lint_skill_body(body) or re.search(r"(?im)^\s*TOOL:", body):
             raise ValueError
         return proposal
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError, Refused) as exc:
         raise MasteryError(
             "The model did not produce a safe, independently verifiable proposal."
         ) from exc

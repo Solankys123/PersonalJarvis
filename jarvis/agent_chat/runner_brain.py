@@ -611,6 +611,7 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
     from jarvis.core.config import get_jarvis_agent_secret, override_provider_secrets
     from jarvis.core.redact import redact_secrets
     from jarvis.forge import mastery
+    from jarvis.forge.tool import ForgeMindTool
     from jarvis.skills.skill_context import try_get_skill_context
     from jarvis.society.browser.tool import lead_browser_tools
 
@@ -635,7 +636,10 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
             "Describe the skill to master or complete a task in this chat first."
         )
     prior = mastery.mastery_match(task)
-    tools = mastery.exercise_tools(brain._apply_turn_override_tools(None, override))
+    available = brain._apply_turn_override_tools(None, override)
+    forge = available.get("forge_mind")
+    tools = mastery.exercise_tools(available)
+    browser_search = isinstance(forge, ForgeMindTool) and "society_browser" in tools
     if not reuse and "search_web" not in tools:
         raise mastery.MasteryError("Current documentation search is unavailable in this chat.")
     expires = time.monotonic() + APPROVAL_TIMEOUT_S
@@ -663,6 +667,60 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
             trace_id=handle.trace_id, rationale=rationale,
         )
 
+    def check_active_skill() -> None:
+        current_skill = mastery.mastery_match(task)
+        if current_skill is None or current_skill.body_hash != prior.body_hash:
+            raise mastery.MasteryError("The mastered skill changed during reuse.")
+
+    async def run_browser(search: mastery.BrowserSearch, *, scoped: bool = False) -> None:
+        def guard() -> None:
+            check_permission()
+            if reuse:
+                check_active_skill()
+
+        guard()
+
+        async def approve_action(*args):
+            guard()
+            if scoped:
+                return "allow"
+            return await handle.request_approval(*args)
+
+        def scoped_approval(name: str, args: dict[str, Any]) -> bool:
+            try:
+                check_permission()
+            except (mastery.MasteryError, asyncio.CancelledError):
+                return False
+            if name == "forge_mind":
+                return not args
+            if name != "society_browser_action":
+                return False
+            return args in (
+                {"action": {verb: {}}}
+                for verb in ("navigate", "input_text", "click", "send_keys", "done")
+            )
+
+        if scoped:
+            bridge.arm(ref, ChatGrant(
+                handle.session.session_id, handle.turn_id, "always_ask", set(),
+                handle.request_approval, call_id_for=mirror.open_call_id,
+                scoped_approval=scoped_approval,
+            ))
+        result = await executor.execute(
+            forge, {}, trace_id=handle.trace_id, rationale="Verify a public browser search",
+            config_snapshot={
+                **override.tool_context,
+                "forge_interactive": True,
+                "forge_browser_model": (override.provider, override.model),
+                "forge_mastery_search": (search.url, search.query),
+                "forge_search_guard": guard,
+                "forge_ask": approve_action,
+            },
+        )
+        guard()
+        if not result.success:
+            raise mastery.MasteryError(f"Browser search verification failed ({result.error}).")
+
     check_permission()
     secret = _agent_secret(get_jarvis_agent_secret, handle.session.provider)
     with override_provider_secrets({handle.session.provider: secret} if secret else {}):
@@ -678,9 +736,19 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
                 model, mastery.reuse_prompt(task, instructions, tools), max_tokens=3000,
             )
             check_permission()
-            calls = mastery.parse_proposal(reply, tools, reuse=True)
+            calls = mastery.parse_proposal(
+                reply, tools, reuse=True,
+                browser_search=browser_search and mastery.BROWSER_SEARCH_GUIDANCE in instructions,
+            )
             if calls is None:
                 return instructions
+            if isinstance(calls, mastery.BrowserSearch):
+                if not mastery.matches_browser_scope(instructions, calls, task):
+                    raise mastery.MasteryError(
+                        "The requested search is outside the verified scope."
+                    )
+                await run_browser(calls)
+                return f"Applied /{prior.name} and verified the displayed search results."
             await asyncio.to_thread(
                 mastery.bind_folder_scope, calls, tools, Path(override.tool_context["cwd"]),
                 reuse=True,
@@ -688,9 +756,7 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
 
             async def run_saved(call):
                 check_permission()
-                current_skill = mastery.mastery_match(task)
-                if current_skill is None or current_skill.body_hash != prior.body_hash:
-                    raise mastery.MasteryError("The mastered skill changed during reuse.")
+                check_active_skill()
                 return await execute_call(call, calls.check, "Apply verified skill " + prior.name)
 
             await mastery.exercise(calls, run_saved, check_permission, reuse=True)
@@ -706,10 +772,12 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
         references = mastery.search_references(research)
         check_permission()
         reply = await mastery.complete(
-            model, mastery.planning_prompt(task, tools, prior, references), max_tokens=4000,
+            model, mastery.planning_prompt(
+                task, tools, prior, references, browser_search=browser_search,
+            ), max_tokens=4000,
         )
     check_permission()
-    proposal = mastery.parse_proposal(reply, tools)
+    proposal = mastery.parse_proposal(reply, tools, browser_search=browser_search)
     assert isinstance(proposal, mastery.Proposal)
     if not any(row["url"] in proposal.knowledge for row in references):
         raise mastery.MasteryError("The proposed guidance did not cite the research results.")
@@ -719,9 +787,11 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
         if prior is None and any(s.name == proposal.name for s in context.registry.list()):
             raise mastery.MasteryError("That skill name is already in use.")
 
-    await asyncio.to_thread(
-        mastery.bind_folder_scope, proposal, tools, Path(override.tool_context["cwd"]),
-    )
+    practice = proposal.practice
+    if isinstance(practice, mastery.Exercise):
+        await asyncio.to_thread(
+            mastery.bind_folder_scope, practice, tools, Path(override.tool_context["cwd"]),
+        )
 
     async with asyncio.timeout(max(0, expires - time.monotonic())):
         decision = await handle.request_approval(
@@ -732,6 +802,11 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
     check_permission()
     if decision not in {"allow", "allow_always"}:
         return "Skill mastery declined. The exercise did not run."
+
+    if isinstance(practice, mastery.BrowserSearch):
+        await run_browser(practice, scoped=True)
+        name = await mastery.save(proposal, context.registry, handle.bus, prior)
+        return f"Verified and activated /{name}. The skill is available for future matching tasks."
 
     # Only the exact new-file operation can consume the scoped approval.
     # Other confirmation gates, including plausibility, retain their cards.
@@ -757,11 +832,11 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
         nonlocal active
         active = call
         try:
-            return await execute_call(call, proposal.check, "FORGE mastery exercise")
+            return await execute_call(call, practice.check, "FORGE mastery exercise")
         finally:
             active = None
 
-    await mastery.exercise(proposal, execute, check_permission)
+    await mastery.exercise(practice, execute, check_permission)
     name = await mastery.save(proposal, context.registry, handle.bus, prior)
     return f"Verified and activated /{name}. The skill is available for future matching tasks."
 

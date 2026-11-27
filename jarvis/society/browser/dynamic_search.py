@@ -246,7 +246,9 @@ class SearchCapture:
                 reason = "page_unchanged"
             elif not self.matches_results(before):
                 reason = "query_unconfirmed"
-            elif self.finish_from_evidence and not before[2]["renderedResults"]:
+            elif (
+                self.finish_from_evidence or self.args.get("require_rendered_results")
+            ) and not before[2]["renderedResults"]:
                 reason = "rendered_results_missing"
             else:
                 reason = ""
