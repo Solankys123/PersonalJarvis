@@ -1,4 +1,59 @@
-# FORGE MIND fixture workflow
+# FORGE MIND
+
+## Public web search in Agent Chat
+
+Alpha 0.3 uses the existing Jarvis browser agent and the model selected in
+Agent Chat. Enable FORGE and install the managed browser in the app.
+Use a browser-capable model connection and set the FORGE run timeout to 60
+seconds in the config editor for initial acceptance. Approve each request
+shown by the current agent's browser policy. On an unlocked Windows desktop,
+watch the search in its own temporary Chrome window. Agent Chat reports the
+run outcome after the window closes.
+
+For a permitted public search on the Python documentation, enter these
+commands in Agent Chat. Replace `1` with the returned draft version.
+
+1. `forge learn web https://docs.python.org/3/search.html asyncio`
+2. `forge inspect 1`
+3. `forge validate 1 web https://docs.python.org/3/search.html dataclasses`
+4. `forge promote 1`
+5. `forge replay web https://docs.python.org/3/search.html pathlib`
+
+Replay without a version selects the newest promoted Alpha 0.3 search for
+the exact origin. Use `forge replay 1 web URL QUERY` to select a specific
+version. Validation requires a different-length public phrase in a fresh
+profile. Try **Cancel** during an approval prompt to test cancellation,
+or deny a pending action to test the agent's approval policy. A draft
+requires a verified completion and explicit promotion before replay.
+
+The current scope is public searches with one input parameter and a bounded
+sequence of navigation, indexed controls, text entry, and Enter. JavaScript
+runs in a fresh profile. Requests stay on the authorized origin and use GET.
+Redirects, WebSockets, downloads, logins, and CAPTCHA-handling actions are
+outside this profile. Sites that require those capabilities or cross-origin
+assets can fail with a bounded error code. On `search_page_drift`, inspect
+the saved version and learn a new draft if the interface changed. On
+`browser_restricted_page`, stop at the site's restriction.
+
+FORGE SQLite stores the origin, action types, structural fingerprints of
+controls, a run identifier, and query length. Privately rendered page text,
+URLs beyond the origin, input values, cookies, and model responses are
+excluded from the procedure and approval records. The existing Agent Chat
+transcript still contains the command as typed, and the selected model
+processes the live browser observations for the explicit run.
+
+Alpha 0.2's fixed HTML path remains available through
+`forge learn web-legacy URL QUERY`. Validate and replay existing versions
+with their usual versioned `web` commands.
+
+Run the controlled browser acceptance tests from PowerShell using the
+existing managed browser Python and Chrome executable:
+
+```powershell
+$env:JARVIS_BROWSER_TEST_PYTHON = python -c "from jarvis.society.browser.install import venv_python; print(venv_python())"
+$env:JARVIS_BROWSER_TEST_EXECUTABLE = python -c "from jarvis.society.browser.install import browser_executable; print(browser_executable())"
+python -m pytest -q -p no:cacheprovider tests/forge/test_agent_chat_web_search.py
+```
 
 ## Local browser skill
 

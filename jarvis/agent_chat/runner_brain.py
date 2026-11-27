@@ -488,7 +488,16 @@ async def run_brain_turn(
         system_extra=system_extra,
     )
     override = replace(
-        override, tool_context={**override.tool_context, "forge_interactive": forge_command}
+        override,
+        tool_context={
+            **override.tool_context,
+            "forge_interactive": forge_command,
+            **(
+                {"forge_browser_model": (override.provider, override.model)}
+                if forge_command
+                else {}
+            ),
+        },
     )
     if not forge_command:
         _note_skill_trigger(brain, text)

@@ -2,8 +2,9 @@ from dataclasses import asdict
 
 import pytest
 
-from jarvis.forge.engine import Refused
-from jarvis.forge.live_navigation import Navigation, PageShape
+from jarvis.forge.engine import Evidence, Refused, State, Verdict
+from jarvis.forge.live_navigation import DynamicSearch, Navigation, PageShape
+from jarvis.forge.store import Store
 
 
 def test_navigation_uses_ephemeral_parameters():
@@ -55,3 +56,43 @@ def test_navigation_requires_successful_observed_destination():
             after=PageShape(main=True, heading=True),
             succeeded=False,
         )
+
+
+def test_promoted_dynamic_search_lookup_after_reopen(tmp_path):
+    path = tmp_path / "forge.sqlite"
+    store = Store(path)
+    origin = "https://example.test"
+    steps = ("navigate", "input_text:" + "a" * 64, "click:" + "b" * 64, "verify_results")
+    spec = DynamicSearch(origin, steps)
+
+    def evidence(target, length):
+        return [
+            Evidence(
+                target,
+                step,
+                f"length:{length}",
+                State.BLANK,
+                State.MATCH,
+                Verdict.SUCCESS,
+                "verified",
+                index,
+            )
+            for index, step in enumerate(steps, 1)
+        ]
+
+    assert store.record("learn", "learn", None, Verdict.SUCCESS, evidence("first", 6), spec) == (
+        1,
+        Verdict.SUCCESS,
+    )
+    assert store.promoted_search(origin) is None
+    assert store.record(
+        "validate", "validate", 1, Verdict.SUCCESS, evidence("second", 4), spec
+    ) == (
+        1,
+        Verdict.SUCCESS,
+    )
+    store.promote(1, authorized=True)
+    reopened = Store(path)
+    assert reopened.promoted_search(origin) == 1
+    assert reopened.promoted_search("https://other.test") is None
+    assert reopened.get(1) == (spec, "promoted")

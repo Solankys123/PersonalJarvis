@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import threading
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +20,7 @@ from jarvis.agent_chat.store import AgentChatStore
 from jarvis.brain.manager import BrainManager
 from jarvis.core.bus import EventBus
 from jarvis.core.config import JarvisConfig
+from jarvis.core.protocols import BrainDelta
 from jarvis.forge.engine import Limits
 from jarvis.forge.store import Store
 from jarvis.forge.tool import ForgeMindTool
@@ -38,13 +41,13 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def search_site():
-    fixture = SimpleNamespace(requests=[], list_tag="ul")
+    fixture = SimpleNamespace(requests=[], list_tag="ul", dynamic=False, moved=False)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             parts = urlsplit(self.path)
             query = parse_qs(parts.query).get("q", [""])[0]
-            fixture.requests.append((parts.path, query, self.headers.get("Cookie")))
+            fixture.requests.append((parts.path, query, self.headers.get("Cookie") or None))
             if parts.path == "/redirect":
                 self.send_response(302)
                 other_origin = fixture.origin.replace("127.0.0.1", "localhost")
@@ -53,12 +56,36 @@ def search_site():
                 return
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
+            if fixture.dynamic:
+                self.send_header("Set-Cookie", "fixture_session=private cookie")
             self.end_headers()
             if query:
                 tag = fixture.list_tag
                 body = (
                     f"<h1>Results for {escape(query)}</h1>"
                     f"<{tag}><li>private fixture text</li></{tag}>"
+                )
+            elif fixture.dynamic and parts.path == "/catalog":
+                extra = "<button>Other control</button>" if fixture.moved else ""
+                body = (
+                    extra
+                    + """<h1>Catalog</h1>
+                <button aria-label="Open catalog search">Open catalog search</button>
+                <section></section><script>
+                document.querySelector('button:last-of-type').onclick = () => {
+                    const area = document.querySelector('section');
+                    area.innerHTML = '<input type=search aria-label="Catalog query">'
+                        + '<button aria-label="Find items">Find items</button>';
+                    area.querySelector('button').onclick = async () => {
+                        const query = area.querySelector('input').value;
+                        await fetch('/results?q=' + encodeURIComponent(query));
+                        const result = document.createElement('h2');
+                        result.textContent = 'Catalog matches for ' + query;
+                        area.replaceChildren(result,
+                            document.createTextNode('private fixture text'));
+                    };
+                };
+                </script>"""
                 )
             else:
                 credential = (
@@ -88,7 +115,9 @@ def search_site():
         thread.join()
 
 
-async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site):
+@pytest.mark.parametrize("dynamic", [False, True], ids=["legacy", "dynamic"])
+async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site, dynamic):
+    search_site.dynamic = dynamic
     for name, env in (
         ("venv_python", "JARVIS_BROWSER_TEST_PYTHON"),
         ("browser_executable", "JARVIS_BROWSER_TEST_EXECUTABLE"),
@@ -106,6 +135,7 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site)
     caller = SimpleNamespace(
         agent_id="lead",
         model="",
+        provider="openai-codex",
         state="active",
         denies=[],
         grant_mode="default",
@@ -128,11 +158,58 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site)
         roster=SimpleNamespace(get=roster_get),
         browser=SimpleNamespace(_python=None),
     )
+    # Patch both bindings after the surface imports the real runtime accessor.
+    monkeypatch.setattr("jarvis.society.surface.current_runtime", lambda: runtime)
     monkeypatch.setattr("jarvis.society.runtime.current_runtime", lambda: runtime)
+
+    class FixtureModel:
+        calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            observation = "\n".join(
+                str(message.content) for message in request.messages if message.role == "user"
+            )
+            lines = observation.splitlines()
+
+            def indexed(label, tag):
+                for line in reversed(lines):
+                    match = re.search(rf"\[(\d+)\]\s*<{tag}\b", line)
+                    if match and label in line:
+                        return int(match[1])
+                return None
+
+            query = re.search(
+                r"public search interface to display results for '([^']+)'", observation
+            )
+            assert query
+            value = query[1]
+            if self.calls == 4:
+                assert f"Catalog matches for {value}" in observation
+                action = {"done": {"text": "Results rendered", "success": True}}
+            elif self.calls == 3:
+                action = {"click": {"index": indexed("Find items", "button")}}
+            elif self.calls == 2:
+                action = {"input": {"index": indexed("Catalog query", "input"), "text": value}}
+            else:
+                action = {"click": {"index": indexed("Open catalog search", "button")}}
+            yield BrainDelta(
+                content=json.dumps(
+                    {
+                        "thinking": "",
+                        "evaluation_previous_goal": "Ready",
+                        "memory": "",
+                        "next_goal": "Find results",
+                        "action": [action],
+                    }
+                )
+            )
 
     def start():
         runtime.browser.live = LiveSessions(tmp_path)
         runtime.browser.live.executor = executor
+        if dynamic:
+            runtime.browser.live.model_resolver = lambda _: FixtureModel()
         forge = ForgeMindTool(Store(db.path), unexpected, Limits(seconds=60))
         brain = BrainManager(config, bus, tools={forge.name: forge}, tool_executor=executor)
         monkeypatch.setattr(brain, "_generate", unexpected)
@@ -169,15 +246,25 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site)
 
     origin = search_site.origin
     start_url = f"{origin}/catalog"
-    steps = ["navigate", "input_text", "click", "verify_results"]
+    learn = "forge learn web" if dynamic else "forge learn web-legacy"
+    steps = (
+        ["navigate", "click", "input_text", "click", "done"]
+        if dynamic
+        else ["navigate", "input_text", "click", "verify_results"]
+    )
     try:
-        assert await send(f"forge learn web {start_url} cobalt") == (
+        learned = await send(f"{learn} {start_url} cobalt")
+        assert learned == (
             "FORGE procedure 1 is draft. Verification succeeded.",
             steps,
-        )
+        ), runtime.browser.live.sessions.get(caller.agent_id).stderr_tail
         assert await send("forge inspect 1") == (
             "FORGE procedure 1 is draft. Verified public search steps are "
-            "navigate, input text, click, verify results.",
+            + (
+                "navigate, click, input text, click, verify results."
+                if dynamic
+                else "navigate, input text, click, verify results."
+            ),
             [],
         )
         assert (await send(f"forge replay 1 web {start_url} violet"))[0].endswith(
@@ -194,18 +281,21 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site)
 
         await runtime.browser.live.close()
         service, session_id = start()
-        assert await send(f"forge replay 1 web {start_url} green marble") == (
+        replay = "forge replay web" if dynamic else "forge replay 1 web"
+        assert await send(f"{replay} {start_url} green marble") == (
             "FORGE procedure 1 is promoted. Verification succeeded.",
             steps,
         )
-        assert search_site.requests[-1] == ("/catalog", "green marble", None)
+        assert ("/results" if dynamic else "/catalog", "green marble", None) in search_site.requests
 
         search_site.list_tag = "ol"
+        search_site.moved = True
         assert (await send(f"forge replay 1 web {start_url} plum"))[0].endswith(
             "(search_page_drift)."
         )
+        search_site.moved = False
         assert (await send(f"forge replay 1 web {origin}/redirect mint"))[0].endswith(
-            "(search_page_drift)."
+            "(browser_navigation_blocked)." if dynamic else "(search_page_drift)."
         )
         assert not any(path == "/other" for path, _, _ in search_site.requests)
         assert await send(
@@ -215,16 +305,18 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site)
             [],
         )
 
-        assert (await send(f"forge learn web {origin}/sensitive lemon"))[0].endswith(
-            "(search_page_drift)."
+        assert (await send(f"{learn} {origin}/sensitive lemon"))[0].endswith(
+            "(browser_restricted_page)." if dynamic else "(search_page_drift)."
         )
-        assert (await send(f"forge learn web {start_url}?token=secret lemon"))[0].endswith(
+        assert (await send(f"{learn} {start_url}?token=secret lemon"))[0].endswith(
             "(public_search_start_url_required)."
         )
-        assert (await send(f"forge learn web {start_url} peppermint", deny="click"))[1] == steps[:3]
-        assert (await send(f"forge learn web {start_url} mangosteen", cancel="click"))[1] == steps[
-            :3
-        ]
+        denied_prefix = steps[:2] if dynamic else steps[:3]
+        assert (await send(f"{learn} {start_url} peppermint", deny="click")) == (
+            "FORGE stopped (browser_search_stopped).",
+            denied_prefix,
+        )
+        assert (await send(f"{learn} {start_url} mangosteen", cancel="click"))[1] == denied_prefix
         assert not await approvals.items(state=ApprovalState.PENDING)
         assert not {"peppermint", "mangosteen", "lemon"}.intersection(
             query for _, query, _ in search_site.requests
@@ -241,6 +333,7 @@ async def test_web_search_through_agent_chat(tmp_path, monkeypatch, search_site)
             b"peppermint",
             b"mangosteen",
             b"token=secret",
+            b"private cookie",
         ):
             assert private_value not in raw
     finally:

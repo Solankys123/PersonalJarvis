@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .browser import BrowserProcedure, BrowserStep
 from .engine import Evidence, Procedure, Refused, State, Verdict
-from .live_navigation import LiveSearch
+from .live_navigation import DynamicSearch, LiveSearch
 from .workflow import Action, Marker, Observation, RejectionKey, WorkflowProcedure
 
 SCHEMA = """
@@ -72,7 +72,7 @@ class Store:
 
     def get(
         self, version: int
-    ) -> tuple[Procedure | WorkflowProcedure | BrowserProcedure | LiveSearch, str]:
+    ) -> tuple[Procedure | WorkflowProcedure | BrowserProcedure | LiveSearch | DynamicSearch, str]:
         with self.connection() as db:
             row = db.execute(
                 "SELECT spec, state FROM procedures WHERE version=?",
@@ -84,7 +84,10 @@ class Store:
             raw = json.loads(row[0])
             if not isinstance(raw, dict):
                 raise ValueError("invalid procedure")
-            if type(raw.get("schema_version")) is int and raw["schema_version"] == 5:
+            if type(raw.get("schema_version")) is int and raw["schema_version"] == 6:
+                raw["steps"] = tuple(raw["steps"])
+                procedure = DynamicSearch(**raw)
+            elif type(raw.get("schema_version")) is int and raw["schema_version"] == 5:
                 raw["steps"] = tuple(raw["steps"])
                 procedure = LiveSearch(**raw)
             elif type(raw.get("schema_version")) is int and raw["schema_version"] == 4:
@@ -98,6 +101,17 @@ class Store:
         except (KeyError, ValueError, TypeError):
             raise Refused("unsupported_procedure") from None
         return procedure, row[1]
+
+    def promoted_search(self, origin: str) -> int | None:
+        with self.connection() as db:
+            row = db.execute(
+                """SELECT version FROM procedures
+                WHERE state = 'promoted' AND json_extract(spec, '$.schema_version') = 6
+                AND json_extract(spec, '$.origin') = ?
+                ORDER BY version DESC LIMIT 1""",
+                (origin,),
+            ).fetchone()
+        return row[0] if row else None
 
     def receipt(self, run_id: str) -> tuple[int | None, str] | None:
         with self.connection() as db:
@@ -198,7 +212,7 @@ class Store:
         version: int | None,
         outcome: str,
         evidence: list[Evidence],
-        procedure: WorkflowProcedure | BrowserProcedure | LiveSearch | None = None,
+        procedure: WorkflowProcedure | BrowserProcedure | LiveSearch | DynamicSearch | None = None,
         parent: int | None = None,
     ) -> tuple[int | None, str]:
         final = evidence[-1] if evidence else None
@@ -216,7 +230,7 @@ class Store:
             if not verified:
                 outcome = "goal_not_verified"
         with self.connection() as db:
-            if isinstance(procedure, (BrowserProcedure, LiveSearch)) and verified:
+            if isinstance(procedure, (BrowserProcedure, LiveSearch, DynamicSearch)) and verified:
                 db.execute("BEGIN IMMEDIATE")
             if parent is not None and verified:
                 if not db.in_transaction:
@@ -229,7 +243,7 @@ class Store:
             if mode == "learn" and verified:
                 spec = json.dumps(asdict(procedure if procedure is not None else Procedure()))
                 duplicate = None
-                if isinstance(procedure, (BrowserProcedure, LiveSearch)):
+                if isinstance(procedure, (BrowserProcedure, LiveSearch, DynamicSearch)):
                     duplicate = db.execute(
                         "SELECT p.version FROM procedures p "
                         "LEFT JOIN skill_lineage l USING (version) "

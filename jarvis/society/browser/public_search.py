@@ -67,6 +67,7 @@ async def run_search(worker, args, emit):
                     await operation()
                     result = {"verified_action": name}
                 except Exception:
+                    # Report the failed effect without exposing the query or page contents.
                     result = {"error": "search_page_drift"}
                 emit("action_result", id=permit, result=result)
                 async with asyncio.timeout(10):

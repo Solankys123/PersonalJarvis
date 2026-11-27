@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import logging
 import re
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any
 
 from jarvis.control.cancel import CancelScope, CancelToken, get_kill_switch
@@ -14,7 +14,7 @@ from jarvis.core.protocols import ExecutionContext, ToolResult
 
 from .browser import EXPECTED, BrowserProcedure, Search, run_browser
 from .engine import Evidence, Limits, Procedure, Refused, State, Verdict, execute
-from .live_navigation import LIVE_STEPS, LiveSearch, search_origin
+from .live_navigation import LIVE_STEPS, DynamicSearch, LiveSearch, search_origin
 from .store import Store
 from .workflow import Goal, Marker, WorkflowProcedure, run_workflow
 
@@ -33,7 +33,7 @@ COMMAND = re.compile(
     re.ASCII | re.IGNORECASE,
 )
 WEB_COMMAND = re.compile(
-    r"forge (?:(learn) web|(validate|replay) ([1-9][0-9]{0,8}) web) "
+    r"forge (?:(learn|replay) (web|web-legacy)|(validate|replay) ([1-9][0-9]{0,8}) (web)) "
     r"(\S{1,2048}) ([A-Za-z ]{2,99})",
     re.ASCII | re.IGNORECASE,
 )
@@ -43,10 +43,12 @@ def command(text: str) -> tuple[str, ...] | None:
     text = text.strip()
     web = WEB_COMMAND.fullmatch(text)
     if web:
-        learn, mode, version, url, query = web.groups()
+        automatic, kind, mode, version, _, url, query = web.groups()
+        if automatic and automatic.lower() == "replay" and kind.lower() != "web":
+            return None
         return (
-            (learn.lower(), "web", url, query)
-            if learn
+            (automatic.lower(), kind.lower(), url, query)
+            if automatic
             else (mode.lower(), version, "web", url, query)
         )
     if not COMMAND.fullmatch(text):
@@ -78,8 +80,8 @@ def render_result(result: ToolResult) -> str:
                 reply + f" It searches fixture revision {spec['fixture_version']} by job role "
                 "and work location, then verifies the displayed results." + recent
             )
-        if spec.get("schema_version") == 5:
-            actions = ", ".join(step.replace("_", " ") for step in spec["steps"])
+        if spec.get("schema_version") in (5, 6):
+            actions = ", ".join(step.split(":")[0].replace("_", " ") for step in spec["steps"])
             failures = result.output["recent_failures"]
             recent = f" Recent failures: {', '.join(failures)}." if failures else ""
             return reply + f" Verified public search steps are {actions}." + recent
@@ -103,7 +105,7 @@ class ForgeMindTool:
         "role and location after a version when validating, replaying, or improving. "
         "In Agent Chat use forge learn web URL QUERY to learn a supported public search, "
         "then forge validate VERSION web URL QUERY with a different-length query. "
-        "After promotion, use forge replay VERSION web URL QUERY. "
+        "After promotion, use forge replay web URL QUERY or forge replay VERSION web URL QUERY. "
         "Use forge improve VERSION alpha to explore a new draft, or forge rollback VERSION "
         "to restore the previous validated version. The user utterance supplies the command."
     )
@@ -158,6 +160,12 @@ class ForgeMindTool:
         try:
             if mode == "list":
                 return ToolResult(True, await asyncio.to_thread(self._store.list))
+            if mode == "replay" and params[0] == "web":
+                origin = search_origin(*params[-2:])
+                active = await asyncio.to_thread(self._store.promoted_search, origin)
+                if active is None:
+                    raise Refused("promoted_search_not_found")
+                params.insert(0, str(active))
             version = None if mode == "learn" else int(params[0])
             procedure, state = Procedure(), ""
             if version is not None:
@@ -165,7 +173,7 @@ class ForgeMindTool:
             if mode == "inspect":
                 assert version is not None
                 details = {}
-                if isinstance(procedure, (BrowserProcedure, LiveSearch)):
+                if isinstance(procedure, (BrowserProcedure, LiveSearch, DynamicSearch)):
                     details["recent_failures"] = await asyncio.to_thread(
                         self._store.browser_failures, version
                     )
@@ -189,12 +197,21 @@ class ForgeMindTool:
                 assert version is not None
                 restored = await asyncio.to_thread(self._store.rollback, version, authorized=True)
                 return ToolResult(True, f"FORGE procedure {restored} restored.")
-            if params[0 if mode == "learn" else 1] == "web":
-                if mode != "learn" and not isinstance(procedure, LiveSearch):
+            web_kind = params[0 if mode == "learn" else 1]
+            if web_kind in {"web", "web-legacy"}:
+                if mode != "learn" and not isinstance(procedure, (LiveSearch, DynamicSearch)):
                     raise Refused("live_search_procedure_required")
-                saved = procedure if isinstance(procedure, LiveSearch) else None
-                return await self._run_live_search(mode, version, saved, state, *params[-2:], ctx)
-            if isinstance(procedure, LiveSearch):
+                saved = procedure if isinstance(procedure, (LiveSearch, DynamicSearch)) else None
+                return await self._run_live_search(
+                    mode,
+                    version,
+                    saved,
+                    state,
+                    *params[-2:],
+                    ctx,
+                    legacy_learning=web_kind == "web-legacy",
+                )
+            if isinstance(procedure, (LiveSearch, DynamicSearch)):
                 raise Refused("public_search_parameters_required")
             if isinstance(procedure, BrowserProcedure) or (mode == "learn" and params[0] == "jobs"):
                 if len(params) != 3:
@@ -235,11 +252,13 @@ class ForgeMindTool:
         self,
         mode: str,
         version: int | None,
-        procedure: LiveSearch | None,
+        procedure: LiveSearch | DynamicSearch | None,
         state: str,
         url: str,
         query: str,
         ctx: ExecutionContext,
+        *,
+        legacy_learning: bool = False,
     ) -> ToolResult:
         from jarvis.society.browser.bridge import execute_live
         from jarvis.society.runtime import current_runtime
@@ -259,19 +278,60 @@ class ForgeMindTool:
             raise Refused("draft_required")
         if mode == "replay" and state != "promoted":
             raise Refused("promoted_version_required")
-        if self._limits.actions < len(LIVE_STEPS):
+        if self._limits.actions < (len(procedure.steps) if procedure else len(LIVE_STEPS)):
             raise Refused("action_budget_exceeded")
         if self._active is not None:
             raise Refused("experiment_already_active")
         runtime = current_runtime()
         if runtime is None or runtime.browser._python is not None:
             raise Refused("managed_browser_required")
+        legacy = legacy_learning or isinstance(procedure, LiveSearch)
+        if legacy:
+            browser_options = {
+                "public_search": {
+                    "origin": origin,
+                    "url": url,
+                    "query": query,
+                    "result_list": procedure.result_list
+                    if isinstance(procedure, LiveSearch)
+                    else None,
+                }
+            }
+            args = {}
+        else:
+            expected = procedure.steps if procedure else ()
+            browser_options = {
+                "dynamic_search": {
+                    "origin": origin,
+                    "url": url,
+                    "query": query,
+                    "steps": expected,
+                    "budget": self._limits.actions,
+                }
+            }
+            action_labels = {"input_text": "input", "verify_results": "done"}
+            names = (step.split(":")[0] for step in expected)
+            sequence = ", ".join(action_labels.get(name, name) for name in names)
+            args = {
+                "task": (
+                    f"Navigate to exactly {url} in the existing tab and use the site's public "
+                    f"search interface to display results for {query!r}. Enter only that query. "
+                    "Use indexed search controls or Enter. Use one action at a time. "
+                    "Stop if login, consent, or CAPTCHA is required. "
+                    "Finish successfully only when the rendered search results are visible."
+                    + (f" Follow this action order: {sequence}." if sequence else "")
+                ),
+                "max_steps": self._limits.actions,
+            }
         async with CancelScope(get_kill_switch(), holder="forge") as token:
             self._active = token
             try:
                 caller = await runtime.roster.get(runtime.lead_id)
                 if caller is None or str(caller.state) != "active":
                     raise Refused("browser_agent_unavailable")
+                pick = ctx.config.get("forge_browser_model")
+                if not legacy and pick and all(pick) and (caller.provider, caller.model) != pick:
+                    caller = replace(caller, provider=pick[0], model=pick[1])
                 old = await asyncio.to_thread(self._store.claim, run_id, mode, version)
                 if old is not None:
                     return await self._result(*old)
@@ -285,14 +345,9 @@ class ForgeMindTool:
                                     runtime,
                                     caller,
                                     runtime.browser,
-                                    {},
+                                    args,
                                     ctx,
-                                    public_search={
-                                        "origin": origin,
-                                        "url": url,
-                                        "query": query,
-                                        "result_list": procedure.result_list if procedure else None,
-                                    },
+                                    **browser_options,
                                 )
                             )
                             cancel = group.create_task(token.wait_until_cancelled())
@@ -306,13 +361,35 @@ class ForgeMindTool:
                     if not result.success:
                         raise Refused(
                             result.error
-                            if result.error in {"search_page_drift", "browser_search_stopped"}
+                            if result.error
+                            in {
+                                "search_page_drift",
+                                "browser_search_stopped",
+                                "browser_origin_mismatch",
+                                "browser_restricted_page",
+                                "browser_target_unavailable",
+                                "browser_target_restricted",
+                                "browser_input_restricted",
+                                "browser_action_restricted",
+                                "browser_action_failed",
+                                "browser_navigation_blocked",
+                                "browser_site_unreachable",
+                                "browser_search_model_failed",
+                                "browser_search_model_unavailable",
+                                "search_results_unverified",
+                                "action_budget_exceeded",
+                            }
                             else "browser_search_unavailable"
                         )
                     raw = result.output
                     if not re.fullmatch(r"[0-9a-f]{32}", raw.get("target_id", "")):
                         raise Refused("missing_browser_evidence")
-                    observed = LiveSearch(origin, raw.get("result_list"), tuple(raw["actions"]))
+                    steps = tuple(raw["actions"])
+                    observed = (
+                        LiveSearch(origin, raw.get("result_list"), steps)
+                        if legacy
+                        else DynamicSearch(origin, steps)
+                    )
                     observed.validate()
                     if procedure is not None and procedure != observed:
                         raise Refused("search_page_drift")
@@ -334,11 +411,13 @@ class ForgeMindTool:
                     ]
                     outcome = Verdict.SUCCESS
                 except TimeoutError:
+                    # The receipt below reports the action deadline to the user.
                     outcome = "budget_exceeded"
                 except asyncio.CancelledError:
                     outcome = "cancelled"
                     raise
                 except Refused as exc:
+                    # Persist the bounded refusal reason in the run receipt.
                     outcome = str(exc)
                 finally:
                     if token.is_cancelled():

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -90,6 +91,7 @@ async def execute_live(
     *,
     read_only: bool = False,
     public_search: dict | None = None,
+    dynamic_search: dict | None = None,
 ) -> ToolResult:
     from jarvis.core.config import get_jarvis_agent_secret, override_provider_secrets
 
@@ -111,7 +113,12 @@ async def execute_live(
         return ToolResult(False, None, stopped_message)
     executor = live.executor() if callable(live.executor) else live.executor
     if executor is None or (public_search is None and live.model_resolver is None):
-        return ToolResult(False, None, "Browser model service is not ready")
+        error = (
+            "browser_search_model_unavailable"
+            if dynamic_search is not None
+            else "Browser model service is not ready"
+        )
+        return ToolResult(False, None, error)
     brain, provider, overrides = None, None, {}
     if public_search is None:
         provider = caller.provider or _default_provider(runtime)
@@ -122,6 +129,8 @@ async def execute_live(
                 brain = await asyncio.to_thread(live.model_resolver, caller)
         except LookupError:
             # A chat-only CLI must not fall back to an API-billed provider.
+            if dynamic_search is not None:
+                return ToolResult(False, None, "browser_search_model_unavailable")
             return ToolResult(
                 False,
                 None,
@@ -129,6 +138,8 @@ async def execute_live(
                 "Choose another connected model in its Model menu.",
             )
         if brain is None or not callable(getattr(brain, "complete", None)):
+            if dynamic_search is not None:
+                return ToolResult(False, None, "browser_search_model_unavailable")
             return ToolResult(False, None, "This agent has no browser-capable model connection")
     usage_total = {"input_tokens": 0, "output_tokens": 0, "cache_hit_tokens": 0}
     vision_available = bool(getattr(brain, "supports_vision", False))
@@ -190,6 +201,8 @@ async def execute_live(
                     vision_available = False
                     text = ""
                     continue
+                if dynamic_search is not None:
+                    return {"ok": False, "error": "browser_search_model_failed"}
                 raise
         for field in usage_total:
             usage_total[field] += int(usage.get(field, 0))
@@ -197,11 +210,19 @@ async def execute_live(
 
     denied = False
     verified_actions: list[str] = []
+    forge_search = public_search or dynamic_search
     search_actions = {
         "navigate": "Open public search",
         "input_text": "Fill the public search field",
         "click": "Submit the public search form",
         "verify_results": "Verify the displayed search results",
+    }
+    dynamic_actions = {
+        "navigate": search_actions["navigate"],
+        "input_text": search_actions["input_text"],
+        "click": "Click a search control",
+        "send_keys": "Run search with Enter",
+        "done": search_actions["verify_results"],
     }
 
     async def action(payload: dict) -> dict:
@@ -233,6 +254,15 @@ async def execute_live(
             ):
                 denied = True
                 return {"ok": False, "error": "Unexpected FORGE search action"}
+        if dynamic_search is not None and (
+            name not in dynamic_actions
+            or parameters
+            or payload.get("url") != dynamic_search["origin"]
+            or payload.get("confirm") is not True
+            or len(verified_actions) >= dynamic_search["budget"]
+        ):
+            denied = True
+            return {"ok": False, "error": "Unexpected FORGE search action"}
         target_url = parameters.get("url")
         if target_url and urlsplit(str(target_url)).scheme not in {"http", "https"}:
             denied = True
@@ -279,7 +309,13 @@ async def execute_live(
             return {"ok": False, "error": "Browser action blocked by agent policy"}
         trace = getattr(ctx, "trace_id", uuid4())
         if verdict is Verdict.QUEUE:
-            description = search_actions[name] if public_search is not None else name
+            description = (
+                dynamic_actions[name]
+                if dynamic_search is not None
+                else search_actions[name]
+                if public_search is not None
+                else name
+            )
             approval = await runtime.approvals.enqueue(
                 agent_id=caller.agent_id,
                 trace_id=str(trace),
@@ -294,7 +330,7 @@ async def execute_live(
                 denied = True
                 live.stop_turn(caller.agent_id, turn_trace)
                 return {"ok": False, "error": stopped_message}
-        utterance = "FORGE public search" if public_search else getattr(ctx, "user_utterance", "")
+        utterance = "FORGE public search" if forge_search else getattr(ctx, "user_utterance", "")
         result = await executor.execute(
             ApprovedBrowserAction(payload["apply"], read_only=read_only),
             {"action": proposal},
@@ -306,6 +342,18 @@ async def execute_live(
             if result.output != {"verified_action": name}:
                 return {"ok": False, "error": "Missing browser action evidence"}
             verified_actions.append(name)
+        if dynamic_search is not None and result.success:
+            step = result.output.get("verified_step") if isinstance(result.output, dict) else None
+            pattern = (
+                "verify_results"
+                if name == "done"
+                else "navigate"
+                if name == "navigate"
+                else rf"{name}:[0-9a-f]{{64}}"
+            )
+            if not isinstance(step, str) or not re.fullmatch(pattern, step):
+                return {"ok": False, "error": "Missing browser action evidence"}
+            verified_actions.append(step)
         return {"ok": result.success, "error": result.error}
 
     task = str(args.get("task") or "").strip()
@@ -335,19 +383,20 @@ async def execute_live(
             trace_id=turn_trace,
             chat_session_id=chat_session_id,
             **({"public_search": public_search} if public_search is not None else {}),
+            **({"dynamic_search": dynamic_search} if dynamic_search is not None else {}),
         )
     except Exception as exc:
         # The tool result reports the failure to both the chat and the planner.
+        stopped = (caller.agent_id, turn_trace) in live.stopped_turns
+        if forge_search is not None:
+            error = "browser_search_stopped" if stopped else "browser_search_unavailable"
+            return ToolResult(False, None, error)
         return ToolResult(
             False,
             None,
-            stopped_message
-            if (caller.agent_id, turn_trace) in live.stopped_turns
-            else "browser_search_unavailable"
-            if public_search is not None
-            else str(exc),
+            stopped_message if stopped else str(exc),
         )
-    if public_search is not None:
+    if forge_search is not None:
         return ToolResult(
             bool(result.get("ok")),
             {**result, "actions": verified_actions},

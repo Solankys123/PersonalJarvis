@@ -9,6 +9,37 @@ from urllib.parse import urlsplit
 from .engine import Evidence, Refused, State, Verdict
 
 LIVE_STEPS = ("navigate", "input_text", "click", "verify_results")
+MAX_WEB_STEPS = 12
+
+
+@dataclass(frozen=True)
+class DynamicSearch:
+    """Verified action and structural target pairs for a public search."""
+
+    origin: str
+    steps: tuple[str, ...]
+    schema_version: int = 6
+
+    def validate(self) -> None:
+        if (
+            type(self.schema_version) is not int
+            or self.schema_version != 6
+            or self.origin != _origin(self.origin)
+            or not 4 <= len(self.steps) <= MAX_WEB_STEPS
+            or self.steps[0] != "navigate"
+            or self.steps[-1] != "verify_results"
+            or any(
+                not re.fullmatch(r"(?:click|input_text|send_keys):[0-9a-f]{64}", step)
+                for step in self.steps[1:-1]
+            )
+            or not any(step.startswith("input_text:") for step in self.steps)
+            or not self.steps[-2].startswith(("click:", "send_keys:"))
+        ):
+            raise Refused("unsupported_dynamic_search")
+
+    def verifies(self, trace: list[Evidence]) -> bool:
+        self.validate()
+        return _verifies_search(trace, self.steps)
 
 
 @dataclass(frozen=True)
@@ -32,21 +63,25 @@ class LiveSearch:
 
     def verifies(self, trace: list[Evidence]) -> bool:
         self.validate()
-        return (
-            tuple(step.action for step in trace) == self.steps
-            and bool(trace[0].target_id)
-            and re.fullmatch(r"length:[0-9]{1,2}", trace[0].marker) is not None
-            and all(
-                step.target_id == trace[0].target_id
-                and step.marker == trace[0].marker
-                and step.before == State.BLANK
-                and step.after == State.MATCH
-                and step.verdict == Verdict.SUCCESS
-                and step.reason == "verified"
-                and step.attempt == index
-                for index, step in enumerate(trace, 1)
-            )
+        return _verifies_search(trace, self.steps)
+
+
+def _verifies_search(trace: list[Evidence], steps: tuple[str, ...]) -> bool:
+    return (
+        tuple(step.action for step in trace) == steps
+        and bool(trace[0].target_id)
+        and re.fullmatch(r"length:[0-9]{1,2}", trace[0].marker) is not None
+        and all(
+            step.target_id == trace[0].target_id
+            and step.marker == trace[0].marker
+            and step.before == State.BLANK
+            and step.after == State.MATCH
+            and step.verdict == Verdict.SUCCESS
+            and step.reason == "verified"
+            and step.attempt == index
+            for index, step in enumerate(trace, 1)
         )
+    )
 
 
 def search_origin(url: str, query: str) -> str:

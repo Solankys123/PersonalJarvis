@@ -503,6 +503,7 @@ class LiveSessions:
         trace_id: str = "",
         chat_session_id: str = "",
         public_search: dict | None = None,
+        dynamic_search: dict | None = None,
     ) -> dict:
         session = await self.ensure(agent)
         await claim_browser(session, chat_session_id)
@@ -525,6 +526,9 @@ class LiveSessions:
                         "vision": vision,
                         "files": files or [],
                         **({"public_search": public_search} if public_search is not None else {}),
+                        **(
+                            {"dynamic_search": dynamic_search} if dynamic_search is not None else {}
+                        ),
                     },
                     timeout=600,
                 )
