@@ -215,9 +215,9 @@ class ComputerUseTool:
         # turn's task — the speech stall guard's task.cancel() (or any turn
         # unwind, e.g. a TTS abort) would behead a healthy desktop mission.
         # The outcome is ALWAYS announced (AD-OE1/OE5/OE6: zero silent drops).
-        # Without a bus there is nowhere to announce, so the old synchronous
-        # contract stays (tests / minimal wiring).
-        if self._bus is None:
+        # Without a bus there is nowhere to announce. An approved mastery
+        # exercise also needs the harness result before it can activate a skill.
+        if self._bus is None or ctx.config.get("forge_mastery_desktop") is True:
             return await self._dispatch.execute(
                 {
                     "harness": HARNESS_NAME,

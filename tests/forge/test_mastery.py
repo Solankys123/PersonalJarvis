@@ -13,8 +13,10 @@ from jarvis.agent_chat.store import AgentChatStore
 from jarvis.brain.manager import BrainManager
 from jarvis.core.bus import EventBus
 from jarvis.core.config import JarvisConfig
-from jarvis.core.protocols import BrainDelta, ToolResult
+from jarvis.core.protocols import BrainDelta, HarnessResult, ToolResult
 from jarvis.forge.tool import ForgeMindTool
+from jarvis.harness.computer_use_context import ComputerUseContext
+from jarvis.plugins.tool.computer_use_tool import ComputerUseTool
 from jarvis.safety.approval import ApprovalWorkflow
 from jarvis.safety.risk_tier import RiskTierEvaluator
 from jarvis.safety.tool_executor import ToolExecutor
@@ -272,4 +274,84 @@ async def test_adaptive_browser_mastery_and_reuse(mastery_chat, monkeypatch, ver
         await service.send(sid, "Search public jobs for design jobs")
         await asyncio.wait_for(service.wait_turn(sid), timeout=5)
         assert queries == ["sample jobs", "design jobs"]
+        assert model.calls == 3
+
+
+@pytest.mark.parametrize("proof", ["", "Matching jobs are visible for the search query."])
+async def test_signed_in_mastery_awaits_desktop_verifier(mastery_chat, monkeypatch, proof):
+    from jarvis.agent_chat.runner_brain import brain_manager
+
+    service, cwd, registry = mastery_chat
+    goals = []
+
+    class DesktopHarness:
+        async def dispatch(self, name, task):
+            assert name == "screenshot"
+            goals.append(task.prompt)
+            stdout = f"[cu] done (verified: {proof})" if proof else "[cu] done"
+            yield HarnessResult(stdout=stdout, exit_code=0, is_final=True)
+
+    class DesktopModel:
+        calls = 0
+
+        async def complete(self, request):
+            self.calls += 1
+            if self.calls == 1:
+                yield BrainDelta(content="Python CSV official documentation")
+                return
+            prompt = request.messages[0].content
+            assert '"desktop"' in prompt
+            assert '"browser_search":' not in prompt
+            body = {"desktop": {
+                "application": "Brave on Naukri",
+                "goal": "search for sample jobs" if self.calls == 2 else "search for design jobs",
+                "evidence": "Visible job cards match the search query.",
+            }}
+            if self.calls == 2:
+                body.update(
+                    name="signed-in-job-search", description="Search the open job site.",
+                    phrases=["search Naukri jobs"], knowledge=f"Reference {DOCS}.",
+                    method="Search in the open application and verify visible job cards.",
+                )
+            yield BrainDelta(content=json.dumps(body))
+
+    brain = brain_manager()
+    monkeypatch.setattr(
+        "jarvis.plugins.tool.computer_use_tool.peek_computer_use_context",
+        lambda: ComputerUseContext(
+            vision_engine=object(), brain_manager=brain, tool_executor=brain._tool_executor,
+        ),
+    )
+    brain._tools.update({
+        "computer_use": ComputerUseTool(bus=brain._bus, manager=DesktopHarness()),
+        "forge_mind": ForgeMindTool(None, None, None),
+        "society_browser": SearchTool(),
+    })
+    model = DesktopModel()
+    monkeypatch.setattr("jarvis.agent_chat.browser_model.browser_model_for", lambda *_: model)
+    session = service.create_session(
+        surface="jarvis", provider="openai-codex", cwd=str(cwd), permission_mode="ask",
+    )
+    sid = session.session_id
+    events = service.subscribe(sid)
+    await service.send(sid, "Learn and master how to search Naukri jobs in my signed-in Brave")
+    async with asyncio.timeout(5):
+        while (event := await events.get())["kind"] != "approval_required":
+            assert event["kind"] != "turn_finished", event
+    card = event["payload"]
+    assert card["name"] == "forge_mastery"
+    assert card["input"]["exercise"]["tool"] == "computer_use"
+    assert not goals
+    assert service.resolve_approval(sid, card["approval_id"], "allow")
+    await asyncio.wait_for(service.wait_turn(sid), timeout=5)
+    assert goals == [card["input"]["exercise"]["goal"]]
+    assert [
+        row["payload"]["name"] for row in service.store.list_events(sid)
+        if row["kind"] == "approval_required"
+    ] == ["forge_mastery"]
+    assert bool(registry.list_active()) == bool(proof)
+    if proof:
+        await service.send(sid, "Search Naukri jobs for design jobs")
+        await asyncio.wait_for(service.wait_turn(sid), timeout=5)
+        assert "search for design jobs" in goals[1]
         assert model.calls == 3

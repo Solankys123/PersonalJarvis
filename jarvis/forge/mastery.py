@@ -21,6 +21,12 @@ from .live_navigation import search_origin
 
 TAG = "forge-mastery"
 BROWSER_SEARCH_GUIDANCE = "## Verified public browser search"
+DESKTOP_GUIDANCE = "## Verified live desktop method"
+_LIVE_SESSION = re.compile(
+    r"\b(?:signed[ -]in|logged[ -]in|(?:in|using|my) Brave|"
+    r"(?:active|existing|already open) (?:app|application|browser|window|session)|"
+    r"existing (?:Brave|Chrome|Edge|Windows))\b", re.IGNORECASE,
+)
 _COMMAND = re.compile(
     r"(?:master (this skill|the previous task)|learn and master\s+(.+?))[.!]?\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -149,6 +155,15 @@ def planning_prompt(
             'the rendered results. No login, account changes, or uploads.\n\n'
             if browser_search else ""
         )
+        + (
+            'When the task uses an existing desktop app or signed-in browser session, '
+            'use "desktop": {"application": "app and site", "goal": "scoped practical task", '
+            '"evidence": "specific visible outcome"} instead of steps, check or browser_search. '
+            'Use the currently open application/session. For browsing, limit the exercise to '
+            'navigation, searching and reading. Keep private screen details and practice inputs '
+            'out of the durable guidance.\n\n'
+            if "computer_use" in tools else ""
+        )
         + "Available exercise tools:\n" + json.dumps(catalog, ensure_ascii=False)
         + "\n\nPublic search results:\n" + json.dumps(references, ensure_ascii=False)
         + ("\n\nExisting skill (preserve trusted guidance):\n" + prior.body if prior else "")
@@ -158,6 +173,14 @@ def planning_prompt(
 
 def reuse_prompt(task: str, instructions: str, tools: Mapping[str, Tool]) -> str:
     catalog = {name: tool.schema for name, tool in tools.items()}
+    if DESKTOP_GUIDANCE in instructions:
+        return (
+            'Bind the verified live desktop method to the current request. Return JSON with '
+            '"desktop": {"application": "same verified app and site", "goal": "scoped task", '
+            '"evidence": "specific visible outcome"}. Use only current user inputs. If the '
+            'method does not apply or the inputs are missing, return {}.\n\n'
+            "Verified method:\n" + instructions + "\n\nCurrent request:\n" + task
+        )
     if BROWSER_SEARCH_GUIDANCE in instructions:
         return (
             'Bind the verified public browser search to the current request. Return JSON with '
@@ -203,6 +226,37 @@ class BrowserSearch:
         search_origin(self.url, self.query)
 
 
+@dataclass(frozen=True)
+class DesktopPractice:
+    application: str
+    goal: str
+    evidence: str
+
+    def __post_init__(self) -> None:
+        for value, limit in ((self.application, 150), (self.goal, 1000), (self.evidence, 400)):
+            if not isinstance(value, str) or not value.strip() or len(value) > limit:
+                raise ValueError("Invalid desktop practice scope.")
+        if "\n" in self.application or "\r" in self.application:
+            raise ValueError("The desktop application must be a single line.")
+
+    def tool_args(self) -> dict[str, str]:
+        return {"goal": (
+            f"In the existing open {self.application} session, {self.goal}\n"
+            f"Verify on the current screen: {self.evidence}\n"
+            "Use only that existing app or browser session. For website use, stay on the "
+            "named site and only navigate, search, or read. Stop if access is denied or "
+            "a login, consent, or CAPTCHA is required. Do not submit applications, change "
+            "profiles or account settings, upload, send, purchase, or disclose private data."
+        )}
+
+    def matches_skill(self, instructions: str) -> bool:
+        return f"Verified application: {self.application}" in instructions.splitlines()
+
+
+def requires_live_session(task: str) -> bool:
+    return bool(_LIVE_SESSION.search(task))
+
+
 def matches_browser_scope(instructions: str, search: BrowserSearch, task: str) -> bool:
     return (
         f"Verified search entry: {search.url}" in instructions.splitlines()
@@ -212,7 +266,7 @@ def matches_browser_scope(instructions: str, search: BrowserSearch, task: str) -
 
 @dataclass(frozen=True)
 class Proposal:
-    practice: Exercise | BrowserSearch
+    practice: Exercise | BrowserSearch | DesktopPractice
     name: str
     description: str
     phrases: tuple[str, ...]
@@ -221,14 +275,16 @@ class Proposal:
 
     def instructions(self) -> str:
         method = self.method
+        heading = "## Practically verified method"
         if isinstance(self.practice, BrowserSearch):
+            heading = BROWSER_SEARCH_GUIDANCE
             method = f"Verified search entry: {self.practice.url}\n\n" + method
+        if isinstance(self.practice, DesktopPractice):
+            heading = DESKTOP_GUIDANCE
+            method = f"Verified application: {self.practice.application}\n\n" + method
         return (
             "## Researched guidance\n\n" + self.knowledge
-            + "\n\n" + (
-                BROWSER_SEARCH_GUIDANCE if isinstance(self.practice, BrowserSearch)
-                else "## Practically verified method"
-            ) + "\n\n" + method
+            + "\n\n" + heading + "\n\n" + method
             + "\n\nApply this guidance to current user inputs and check the result. "
             "Use current tool permissions and stop when verification fails.\n"
         )
@@ -239,6 +295,11 @@ class Proposal:
             scope = {
                 "exercise": {"url": practice.url, "query": practice.query},
                 "verify": "Check rendered search results in the browser before saving.",
+            }
+        elif isinstance(practice, DesktopPractice):
+            scope = {
+                "exercise": {"tool": "computer_use", **practice.tool_args()},
+                "verify": "Require independent on-screen completion evidence.",
             }
         else:
             scope = {
@@ -259,7 +320,7 @@ class Proposal:
 def parse_proposal(
     reply: str, tools: Mapping[str, Tool], *, reuse: bool = False,
     browser_search: bool = False,
-) -> Proposal | Exercise | BrowserSearch | None:
+) -> Proposal | Exercise | BrowserSearch | DesktopPractice | None:
     from jarvis.agent_chat.folder_tools import FolderTool
     from jarvis.agent_chat.tools import READ_ONLY_TOOLS
 
@@ -310,12 +371,18 @@ def parse_proposal(
         data = json.loads(reply)
         if reuse and data == {}:
             return None
-        if browser_search and "browser_search" in data:
+        if "desktop" in data and "computer_use" in tools:
+            practice = DesktopPractice(**data["desktop"])
+            if any(key in data for key in ("steps", "check", "browser_search")):
+                raise ValueError
+        elif browser_search and "browser_search" in data:
             practice = BrowserSearch(**data["browser_search"])
             if "steps" in data or "check" in data:
                 raise ValueError
         else:
             practice = parse_exercise(data)
+            if any(call.tool == "computer_use" for call in practice.steps):
+                raise ValueError
         if reuse:
             return practice
         name = slugify(short_text(data["name"], 64))

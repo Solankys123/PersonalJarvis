@@ -614,6 +614,7 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
     from jarvis.forge.tool import ForgeMindTool
     from jarvis.skills.skill_context import try_get_skill_context
     from jarvis.society.browser.tool import lead_browser_tools
+    from jarvis.voice.action_phrases import _extract_cu_proof
 
     context = try_get_skill_context()
     executor = getattr(brain, "_tool_executor", None)
@@ -639,7 +640,12 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
     available = brain._apply_turn_override_tools(None, override)
     forge = available.get("forge_mind")
     tools = mastery.exercise_tools(available)
-    browser_search = isinstance(forge, ForgeMindTool) and "society_browser" in tools
+    live_session = mastery.requires_live_session(task)
+    browser_search = (
+        not live_session and isinstance(forge, ForgeMindTool) and "society_browser" in tools
+    )
+    if live_session and "computer_use" not in tools:
+        raise mastery.MasteryError("The authorized live desktop agent is unavailable in this chat.")
     if not reuse and "search_web" not in tools:
         raise mastery.MasteryError("Current documentation search is unavailable in this chat.")
     expires = time.monotonic() + APPROVAL_TIMEOUT_S
@@ -671,6 +677,46 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
         current_skill = mastery.mastery_match(task)
         if current_skill is None or current_skill.body_hash != prior.body_hash:
             raise mastery.MasteryError("The mastered skill changed during reuse.")
+
+    async def run_desktop(practice: mastery.DesktopPractice, *, scoped: bool = False) -> None:
+        args = practice.tool_args()
+
+        def guard() -> None:
+            check_permission()
+            if reuse:
+                check_active_skill()
+
+        def scoped_approval(name: str, proposed: dict[str, Any]) -> bool:
+            try:
+                guard()
+            except (mastery.MasteryError, asyncio.CancelledError):
+                return False
+            return name == "computer_use" and proposed == args
+
+        guard()
+        if scoped:
+            bridge.arm(ref, ChatGrant(
+                handle.session.session_id, handle.turn_id, "always_ask", set(),
+                handle.request_approval, call_id_for=mirror.open_call_id,
+                scoped_approval=scoped_approval,
+            ))
+        pending = asyncio.create_task(executor.execute(
+            tools["computer_use"], args, trace_id=handle.trace_id, user_utterance=task,
+            rationale="Verify the practical exercise in the existing desktop session",
+            config_snapshot={**override.tool_context, "forge_mastery_desktop": True},
+        ))
+        try:
+            while not pending.done():
+                await asyncio.wait((pending,), timeout=0.25)
+                guard()
+            result = pending.result()
+        finally:
+            if not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+        stdout = result.output.get("stdout") if isinstance(result.output, dict) else None
+        if not result.success or not isinstance(stdout, str) or not _extract_cu_proof(stdout):
+            raise mastery.MasteryError("The desktop agent did not verify the visible outcome.")
 
     async def run_browser(search: mastery.BrowserSearch, *, scoped: bool = False) -> None:
         def guard() -> None:
@@ -742,6 +788,15 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
             )
             if calls is None:
                 return instructions
+            if mastery.DESKTOP_GUIDANCE in instructions or live_session:
+                if not isinstance(calls, mastery.DesktopPractice) or not calls.matches_skill(
+                    instructions
+                ):
+                    raise mastery.MasteryError("The requested task is outside the verified app.")
+                await run_desktop(calls)
+                return f"Applied /{prior.name} and verified the visible result."
+            if isinstance(calls, mastery.DesktopPractice):
+                raise mastery.MasteryError("This skill has no verified desktop method.")
             if isinstance(calls, mastery.BrowserSearch):
                 if not mastery.matches_browser_scope(instructions, calls, task):
                     raise mastery.MasteryError(
@@ -788,6 +843,8 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
             raise mastery.MasteryError("That skill name is already in use.")
 
     practice = proposal.practice
+    if live_session and not isinstance(practice, mastery.DesktopPractice):
+        raise mastery.MasteryError("This exercise requires the existing desktop session.")
     if isinstance(practice, mastery.Exercise):
         await asyncio.to_thread(
             mastery.bind_folder_scope, practice, tools, Path(override.tool_context["cwd"]),
@@ -805,6 +862,10 @@ async def _master_skill(brain, text, handle, override, mirror, bridge, ref, *, r
 
     if isinstance(practice, mastery.BrowserSearch):
         await run_browser(practice, scoped=True)
+        name = await mastery.save(proposal, context.registry, handle.bus, prior)
+        return f"Verified and activated /{name}. The skill is available for future matching tasks."
+    if isinstance(practice, mastery.DesktopPractice):
+        await run_desktop(practice, scoped=True)
         name = await mastery.save(proposal, context.registry, handle.bus, prior)
         return f"Verified and activated /{name}. The skill is available for future matching tasks."
 
