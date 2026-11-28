@@ -163,8 +163,10 @@ def planning_prompt(
             'navigation, searching and reading. Keep private screen details and practice inputs '
             'out of the durable guidance. In goal include only the concrete desktop actions. '
             'Omit approval, activation, and other chat workflow instructions from goal and '
-            'evidence. Jarvis handles those separately. Describe evidence the desktop executor '
-            'can observe and report itself.\n\n'
+            'evidence. Jarvis handles those separately. Preserve requested filters and distinct '
+            'items as separate outcomes. A single listing cannot stand in for several. '
+            'Describe a final state that visibly establishes all required outcomes. '
+            'If the desktop verifier cannot observe them together, return {}.\n\n'
             if "computer_use" in tools else ""
         )
         + "Available exercise tools:\n" + json.dumps(catalog, ensure_ascii=False)
@@ -247,6 +249,10 @@ class DesktopPractice:
         goal = (
             f"Use the existing open {self.application} session. {self.goal}\n"
             f"Verify on the current screen: {self.evidence}\n"
+            "If a control has no effect, inspect the current tab and focus and use another "
+            "supported way to reach the same outcome. When exploring results, move to a "
+            "different listing or requested filter after reading the current listing. "
+            "Finish only when the requested evidence is visible.\n"
             "Use only that existing app or browser session. For website use, stay on the "
             "named site and only navigate, search, or read. Stop if access is denied or "
             "a login, consent, or CAPTCHA is required. Do not submit applications, change "

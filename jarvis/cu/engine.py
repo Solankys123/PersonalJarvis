@@ -174,7 +174,11 @@ _SYSTEM_BASE = (
     "happened; check the fresh screenshot.\n"
     "* FIRST verify the effect of your previous action (see PREVIOUS STEPS). "
     "If it visibly failed or did nothing, correct course — do NOT repeat it "
-    "unchanged.\n"
+    "unchanged. Reassess the active window, tab and focused control from the "
+    "fresh frame. Use a different route to the same goal, such as an exact "
+    "element label or keyboard navigation. If a detail view is already open, "
+    "read it once and return to the results when the goal needs other items "
+    "or filters. Reopening the same item adds no coverage.\n"
     "* Prefer click_element with an EXACT label from CLICKABLE ELEMENTS when "
     "one matches your target — it is more reliable than pixel coordinates.\n"
     "* Never two pointer actions (click/drag) in one reply — after the first "
@@ -1532,7 +1536,8 @@ async def run_cu_loop(
                 msg = (
                     f"step {step_idx}: {_summarize_action(action)} REFUSED — "
                     "this exact action already ran on this unchanged screen; "
-                    "the screen did not react. Choose a DIFFERENT action."
+                    "the screen did not react. Reassess the fresh frame and "
+                    "choose a different supported route to the unfinished outcome."
                 )
                 history.append(msg)
                 log.info("[cu] %s", msg)
@@ -1540,8 +1545,8 @@ async def run_cu_loop(
                 if guard_hits >= _MAX_GUARD_HITS:
                     yield _final(
                         stderr=(
-                            f"[cu] fail at step-{step_idx}: I kept trying the "
-                            "same action without any effect on screen.\n"
+                            f"[cu] fail at step-{step_idx}: repeated {kind} "
+                            "refused on an unchanged screen.\n"
                         ),
                         exit_code=_EXIT_FAIL,
                     )

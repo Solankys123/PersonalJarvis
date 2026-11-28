@@ -541,6 +541,7 @@ async def test_duplicate_click_on_unchanged_screen_is_refused(patched):
         [
             '{"action": "click", "x": 500, "y": 500, "target": "play"}',
             '{"action": "click", "x": 502, "y": 498, "target": "play"}',  # same spot
+            '{"action": "key", "keys": ["space"]}',
             '{"action": "done", "reason": "toggled"}',
             '{"done": true, "proof": "playback is running"}',
         ]
@@ -551,7 +552,8 @@ async def test_duplicate_click_on_unchanged_screen_is_refused(patched):
     assert final.exit_code == 0
     clicks = [c for c in executor.calls if c[0] == "click"]
     assert len(clicks) == 1, "the near-identical re-click must be refused"
-    assert any("REFUSED" in user for (_, user) in brain.calls)
+    assert any(name == "hotkey" for name, _ in executor.calls)
+    assert "choose a different supported route" in brain.calls[2][1]
 
 
 async def test_type_that_does_not_land_blocks_the_rest_of_the_batch(patched):
