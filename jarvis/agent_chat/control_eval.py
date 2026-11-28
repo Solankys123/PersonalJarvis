@@ -16,7 +16,8 @@ from .control_types import GoalVerdict
 
 
 async def evaluate_goal(
-    session: Any, objective: str, events: list[dict[str, Any]], language: str = ""
+    session: Any, objective: str, events: list[dict[str, Any]], language: str = "",
+    *, learning: bool = False,
 ) -> GoalVerdict:
     from .runner_api import TurnHandle, build_brain, supports_api_runner
     from .runner_cli import run_cli_turn
@@ -25,9 +26,11 @@ async def evaluate_goal(
     sources = {
         str(e["seq"]): e
         for e in events
-        if e["kind"] in ("assistant_text", "tool_result")
-        or e["kind"] == "notice"
-        and e.get("payload", {}).get("kind") == "native_goal_verdict"
+        if e["kind"] == "tool_result"
+        or not learning and (
+            e["kind"] == "assistant_text"
+            or e["kind"] == "notice" and e["payload"].get("kind") == "native_goal_verdict"
+        )
     }
     evidence = [
         {"seq": e["seq"], "kind": e["kind"], "payload": e["payload"]} for e in sources.values()
@@ -40,7 +43,44 @@ async def evaluate_goal(
         "Return ONLY JSON with keys status (continue|waiting|complete|blocked), reason (string), "
         "progress (boolean), evidence (array of source sequence numbers as strings). "
         "Use waiting only when a tool result confirms unfinished background work. "
-        "Complete requires evidence supporting every requirement.\nGOAL:\n"
+        "Complete requires evidence supporting every requirement.\n"
+    )
+    verdict_type = GoalVerdict
+    if learning:
+        from jarvis.core.redact import safe_preview
+        from jarvis.forge.mastery import MasteryVerdict
+
+        verdict_type = MasteryVerdict
+        calls = {
+            e["payload"].get("call_id"): e["payload"]
+            for e in events if e["kind"] == "tool_call"
+        }
+        learning_evidence = []
+        for row in evidence[-40:]:
+            call = calls.get(row["payload"].get("call_id"), {})
+            learning_evidence.append({
+                "seq": row["seq"],
+                "tool": row["payload"].get("name") or call.get("name"),
+                "arguments": safe_preview(call.get("input")),
+                "failed": bool(row["payload"].get("is_error")),
+                "observation": safe_preview(row["payload"].get("output")),
+            })
+        evidence = learning_evidence
+        sources = {str(row["seq"]): sources[str(row["seq"])] for row in evidence}
+        prompt += (
+            "Require observed completion, such as a readback or an independently verified "
+            "receipt. A dispatch acknowledgment or successful tool exit alone is insufficient. "
+            "Judge the practical exercise. Skill metadata and activation are handled later. "
+            "For complete only, also return lesson with name, description, phrases "
+            "(literal reusable trigger phrases), and body (Markdown). Extract methods, observed "
+            "checks, useful failures and successful recovery from these receipts. Include public "
+            "research links only when supported by the evidence. Do not invent procedures. "
+            "Generalize example inputs. Exclude people, account details, credentials, private "
+            "URLs, paths, filenames, screen contents, raw commands, and raw receipt data. "
+            "If no safe reusable lesson is supported, set lesson to null.\n"
+        )
+    prompt += (
+        "GOAL:\n"
         + objective
         + "\nEVIDENCE:\n"
         + json.dumps(evidence, ensure_ascii=False)
@@ -147,7 +187,7 @@ async def evaluate_goal(
     text = output.strip()
     if text.startswith("```"):
         text = "\n".join(text.splitlines()[1:-1])
-    verdict = GoalVerdict.model_validate_json(text)
+    verdict = verdict_type.model_validate_json(text)
     verdict.evidence = [
         ref
         for ref in verdict.evidence

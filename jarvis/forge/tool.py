@@ -167,16 +167,6 @@ class ForgeMindTool:
         )
 
     async def execute(self, args: dict[str, Any], ctx: ExecutionContext) -> ToolResult:
-        mastery_search = ctx.config.get("forge_mastery_search")
-        if not args and mastery_search is not None:
-            if ctx.config.get("chat_read_only"):
-                return ToolResult(False, None, "read_only")
-            try:
-                return await self._run_live_search(
-                    "mastery", None, None, "", *mastery_search, ctx,
-                )
-            except Refused as exc:
-                return ToolResult(False, None, str(exc))
         words = command(ctx.user_utterance)
         if args or words is None:
             return ToolResult(False, None, "exact_forge_command_required")
@@ -317,11 +307,10 @@ class ForgeMindTool:
         ).startswith("agent-chat:"):
             raise Refused("agent_chat_required")
         origin = search_origin(url, query)
-        mastery = mode == "mastery"
         if procedure is not None and procedure.origin != origin:
             raise Refused("browser_origin_mismatch")
         run_id = self._run_id(ctx, mode, version, "web")
-        receipt = None if mastery else await asyncio.to_thread(self._store.receipt, run_id)
+        receipt = await asyncio.to_thread(self._store.receipt, run_id)
         if receipt is not None:
             return await self._result(*receipt)
         if mode == "validate" and state != "draft":
@@ -363,7 +352,6 @@ class ForgeMindTool:
                     "cleanup_seconds": 16,
                     "model_seconds": self._web_model_seconds,
                     "approval_seconds": self._web_approval_seconds,
-                    "require_rendered_results": mastery,
                 }
             }
             action_labels = {"input_text": "input", "verify_results": "done"}
@@ -395,7 +383,7 @@ class ForgeMindTool:
                     selected = (pick[0], pick[1] or "")
                     if (caller.provider, caller.model) != selected:
                         caller = replace(caller, provider=selected[0], model=selected[1])
-                old = None if mastery else await asyncio.to_thread(
+                old = await asyncio.to_thread(
                     self._store.claim, run_id, mode, version,
                 )
                 if old is not None:
@@ -521,22 +509,17 @@ class ForgeMindTool:
                             model_calls,
                             int((time.monotonic() - started) * 1000),
                         )
-                    if not mastery:
-                        saved = await asyncio.to_thread(
-                            self._store.record,
-                            run_id,
-                            mode,
-                            version,
-                            outcome,
-                            evidence,
-                            procedure,
-                            parent=parent,
-                            auto_promote=auto_promote,
-                        )
-                if mastery:
-                    if outcome != Verdict.SUCCESS:
-                        return ToolResult(False, None, str(outcome))
-                    return ToolResult(True, raw)
+                    saved = await asyncio.to_thread(
+                        self._store.record,
+                        run_id,
+                        mode,
+                        version,
+                        outcome,
+                        evidence,
+                        procedure,
+                        parent=parent,
+                        auto_promote=auto_promote,
+                    )
                 return await self._result(*saved)
             finally:
                 self._active = None

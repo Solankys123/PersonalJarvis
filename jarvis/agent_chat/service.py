@@ -606,8 +606,8 @@ class AgentChatService:
         if session.surface == "society":
             session = await self.bind_society_session(session_id, routine_run=routine_run)
         forge_command = False
-        mastery_command = False
-        mastered_reuse = False
+        mastery_task = None
+        skill_guidance = ""
         if (
             session.surface == "jarvis"
             and direct_user
@@ -615,20 +615,16 @@ class AgentChatService:
             and not control_owned
             and control_runner is None
         ):
-            from jarvis.forge.mastery import mastery_match
             from jarvis.forge.mastery import request as mastery_request
+            from jarvis.forge.mastery import reuse_guidance
             from jarvis.forge.tool import NAMESPACE
 
             forge_command = NAMESPACE.match(text.lstrip()) is not None
-            mastery_command = mastery_request(text) is not None
-            mastered_reuse = (
-                not (forge_command or mastery_command or read_only)
-                and session.permission_mode not in ("plan", "read-only")
-                and supports_cli_runner(resolve_runner(session.provider, surface="jarvis"))
-                and mastery_match(text) is not None
-            )
+            mastery_task = mastery_request(text)
+            if not forge_command and mastery_task is None:
+                skill_guidance = reuse_guidance(text)
         selected_runner = None
-        if session.surface == "jarvis" and not (forge_command or mastery_command):
+        if session.surface == "jarvis" and not forge_command:
             from jarvis.core.task_agent import subscription_seat_off_loop
 
             # The saved chat pick is authoritative. Global worker preferences
@@ -665,7 +661,9 @@ class AgentChatService:
         ):
             from .control import supports_restricted_turn
 
-            if not (forge_command or mastery_command) and not supports_restricted_turn(session):
+            if mastery_task is not None:
+                raise ValueError("A practical learning exercise requires an action-enabled chat.")
+            if not forge_command and not supports_restricted_turn(session):
                 raise ValueError("This runner cannot enforce read-only mode; choose an API model")
         if incoming is not None:
             receipt = await self.receive_message(session_id, incoming)
@@ -682,7 +680,7 @@ class AgentChatService:
             raise ValueError("empty message")
         # What the turn receives; ``text`` stays what the person typed so the
         # timeline shows their sentence rather than a page of extracted PDF.
-        prompt = chat_attachments.compose(text, attached)
+        prompt = chat_attachments.compose(text, attached) + skill_guidance
         # Agent cards serialize Add selections as capability pins. Translate the
         # browser pin to the same validated receipt used by the root composer.
         if session.surface == "jarvis" and any(
@@ -768,7 +766,7 @@ class AgentChatService:
             )
         runner = (
             "brain"
-            if forge_command or mastery_command or mastered_reuse
+            if forge_command
             else selected_runner or resolve_runner(session.provider, surface=session.surface)
         )
         await self._emit(
@@ -828,7 +826,8 @@ class AgentChatService:
                     allow_correction=origin.direct_user and not read_only,
                     context=prompt,
                 )
-                if session.surface == "society" and control_runner is None and not native_goal
+                if mastery_task is not None
+                or (session.surface == "society" and control_runner is None and not native_goal)
                 else None
             )
             run_handle = (
@@ -855,11 +854,9 @@ class AgentChatService:
                     async with self._brain_lock:
                         await run_brain_turn(
                             run_handle,
-                            text if mastery_command else run_prompt,
+                            run_prompt,
                             bridge=self._bridge_for(bus),
                             always_allowed=self.always_allowed(session_id),
-                            **({"mastery_command": True} if mastery_command else {}),
-                            **({"mastered_reuse": True} if mastered_reuse else {}),
                             **({"tool_choices": selected} if selected else {}),
                         )
                 elif supports_cli_runner(runner):
@@ -905,9 +902,47 @@ class AgentChatService:
 
             try:
                 run_prompt = prompt
+                objective = mastery_task
+                if objective is not None:
+                    from jarvis.agent_chat.runner_brain import APPROVAL_TIMEOUT_S
+                    from jarvis.core.redact import redact_secrets
+                    from jarvis.forge.mastery import LEARNING_INSTRUCTIONS, request
+
+                    if not objective:
+                        objective = next((
+                            prior_text for event in reversed(history)
+                            if event["kind"] == "user_message"
+                            and isinstance(prior_text := event["payload"].get("text"), str)
+                            and prior_text.strip() and request(prior_text) is None
+                        ), "")
+                    objective = redact_secrets(objective)
+                    decision = "deny"
+                    if objective:
+                        async with asyncio.timeout(APPROVAL_TIMEOUT_S):
+                            decision = await handle.request_approval(
+                                turn_id, "forge_mastery", {"objective": objective},
+                                "Run this scoped exercise using the usual tool approvals.",
+                            )
+                    if cancel.is_set():
+                        raise asyncio.CancelledError
+                    current = self.store.get_session(session_id)
+                    if (
+                        decision != "allow" or current is None
+                        or current.permission_mode != session.permission_mode
+                    ):
+                        await handle.emit(make_event("assistant_text", {
+                            "turn_id": turn_id, "message_id": uuid.uuid4().hex,
+                            "text": "Learning exercise declined or missing an approved objective.",
+                        }))
+                        await handle.emit(make_event("turn_finished", {
+                            "turn_id": turn_id, "status": "done", "usage": {},
+                            "duration_ms": int((time.monotonic() - started) * 1000),
+                        }))
+                        return
+                    run_prompt = LEARNING_INSTRUCTIONS + objective
                 for _ in range(MAX_ASKS_PER_TURN + 2):
                     await run_attempt(run_prompt)
-                    if completion is None:
+                    if completion is None or session.surface != "society":
                         break
                     continuation = await completion.next_prompt()
                     if continuation is None:
@@ -924,6 +959,23 @@ class AgentChatService:
                     )
                     run_prompt = continuation
                 if completion is not None:
+                    if (
+                        objective is not None and completion.finish_event is not None
+                        and completion.finish_event["payload"].get("status") == "done"
+                        and not completion.receipts.declined and not completion.receipts.blocked
+                    ):
+                        from jarvis.forge.mastery import learn
+
+                        first_seq = max((e["seq"] for e in history), default=history_start)
+                        events = self.store.list_events(session_id, after_seq=first_seq)
+                        name = await learn(handle, objective, events)
+                        await handle.emit(make_event("assistant_text", {
+                            "turn_id": turn_id, "message_id": uuid.uuid4().hex,
+                            "text": (
+                                f"Verified and activated /{name} for future matching tasks."
+                                if name else "No skill was activated from this exercise."
+                            ),
+                        }))
                     await completion.publish()
             except asyncio.CancelledError:
                 await self._emit(
@@ -1238,7 +1290,7 @@ class AgentChatService:
         finally:
             self._approvals.pop(approval_id, None)
             self._approval_session.pop(approval_id, None)
-        if name == "forge_mastery" and decision == "allow_always":
+        if name in {"forge_mastery", "forge_mastery_save"} and decision == "allow_always":
             decision = "allow"
         await self._emit(
             session_id,
